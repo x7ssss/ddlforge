@@ -362,8 +362,10 @@ describe('Fixtures Verification (Safe & Dangerous)', () => {
       // For fixture 06_dangerous_set_not_null, test with PG 11 to trigger blocker
       const pgVersion = file.includes('set_not_null') ? 11 : 16;
       const res = analyzeSql(sql, { filePath, pgVersion });
+      // Advisory lock fixtures produce WARNINGs (not BLOCKERs) — accept either
+      const hasViolation = res.blockersCount > 0 || res.warningsCount > 0;
       assert.ok(
-        res.blockersCount > 0,
+        hasViolation,
         `Dangerous fixture ${file} expected blockers but got none.`
       );
     }

@@ -9,13 +9,14 @@ import { MigrationAnalyzer, AnalysisResult } from './engine/analyzer.js';
 import { formatTerminal } from './reporters/terminal.js';
 import { formatJson } from './reporters/json.js';
 import { formatMarkdown } from './reporters/markdown.js';
+import { formatSarif } from './reporters/sarif.js';
 // executor is imported dynamically inside runApply() to preserve
 // zero-dependency invariant for static linting (ddlforge check).
 
 export interface CliOptions {
   targets: string[];
   pgVersion: number;
-  format: 'terminal' | 'json' | 'markdown';
+  format: 'terminal' | 'json' | 'markdown' | 'sarif';
   quiet: boolean;
   changedOnly: boolean;
   help: boolean;
@@ -35,7 +36,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -94,7 +95,7 @@ export function parseArgs(args: string[]): CliOptions {
       i++;
       if (i < args.length) {
         const fmt = args[i].toLowerCase();
-        if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal') {
+        if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
           options.format = fmt;
         }
       }
@@ -103,7 +104,7 @@ export function parseArgs(args: string[]): CliOptions {
     }
     if (arg.startsWith('--format=')) {
       const fmt = arg.slice(9).toLowerCase();
-      if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal') {
+      if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
         options.format = fmt;
       }
       i++;
@@ -135,7 +136,7 @@ ARGUMENTS:
 
 FLAGS:
   --pg <version>      Target PostgreSQL version (default: 16)
-  --format <type>     Output format: terminal | json | markdown (default: terminal)
+  --format <type>     Output format: terminal | json | markdown | sarif (default: terminal)
   --quiet, -q         Suppress advisories/warnings and emit blockers only
   --changed-only      Use git diff to lint only staged or branch-modified migration files
   --version, -v       Print ddlforge version and exit
@@ -420,6 +421,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       console.log(formatJson([]));
     } else if (options.format === 'markdown') {
       console.log(formatMarkdown([]));
+    } else if (options.format === 'sarif') {
+      console.log(formatSarif([]));
     } else {
       console.log('No migration .sql files found to analyze.');
     }
@@ -447,6 +450,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     console.log(formatJson(results));
   } else if (options.format === 'markdown') {
     console.log(formatMarkdown(results));
+  } else if (options.format === 'sarif') {
+    console.log(formatSarif(results));
   } else {
     console.log(formatTerminal(results, { quiet: options.quiet }));
   }
