@@ -36,7 +36,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -129,6 +129,7 @@ ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock lin
 USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
   ddlforge apply <file.sql> --db <url>     # apply a migration safely
+  ddlforge wrap [options] -- <command...>  # supervise ORM migration deployments
 
 ── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
@@ -158,6 +159,18 @@ FLAGS:
   --monitor-poll-ms <ms>      Lock-monitor polling interval in milliseconds (default: 500)
   --help, -h                  Print this help message and exit
 
+── WRAP (supervise ORM) ──────────────────────────────────────────────
+  ddlforge wrap [options] -- <command...>
+
+ARGUMENTS:
+  <command...>        Migration deployment command to run after safety checks
+
+FLAGS:
+  --dir <path>        Migration directory to scan (defaults: auto-detect prisma/migrations, drizzle, or ./migrations)
+  --allow-blockers    Warn on blockers instead of aborting the command
+  --db <url>          Database URL for pending migration checks (falls back to DATABASE_URL)
+  --help, -h          Print this help message and exit
+
 EXAMPLES:
   $ ddlforge ./prisma/migrations
   $ ddlforge ./drizzle --pg 14 --format json
@@ -166,6 +179,9 @@ EXAMPLES:
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb --dry-run
   $ ddlforge apply ./migrations/001_add_index.sql --db \$DATABASE_URL --lock-timeout 5000 --max-retries 3
+  $ ddlforge wrap -- npx prisma migrate deploy
+  $ ddlforge wrap --dir=./drizzle -- npx drizzle-kit migrate
+  $ ddlforge wrap --allow-blockers -- npm run migrate
 `);
 }
 
@@ -400,6 +416,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect apply subcommand
   if (argv[0] === 'apply') {
     return runApply(argv.slice(1));
+  }
+
+  // Detect wrap subcommand
+  if (argv[0] === 'wrap') {
+    const { runWrap } = await import('./wrapper/orchestrator.js');
+    return runWrap(argv.slice(1));
   }
 
   const options = parseArgs(argv);

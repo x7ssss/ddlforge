@@ -19,3 +19,6 @@ export * from './reporters/index.js';
 
 // CLI Utilities
 export { parseArgs, discoverSqlFiles, runCli, CliOptions } from './cli.js';
+
+// Wrapper
+export * from './wrapper/orchestrator.js';
