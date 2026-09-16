@@ -1,4 +1,4 @@
-# 🛡️ ddlforge
+# ddlforge
 
 > **Ultra-fast, zero-runtime-dependency PostgreSQL migration lock linter & data-loss prevention engine.**  
 > Built for Node.js 20+ and TypeScript. Designed for high-traffic Prisma, Drizzle, and raw SQL backends.
@@ -10,7 +10,7 @@
 
 ---
 
-## ⚡ Why ddlforge?
+## Why ddlforge?
 
 In PostgreSQL, DDL commands take **table-level locks**. Even if a migration takes only milliseconds to run, if it requests an `ACCESS EXCLUSIVE` or `SHARE` lock while a long-running `SELECT` or transaction is open:
 1. The migration stalls waiting for the lock.
@@ -28,7 +28,7 @@ Furthermore, ORMs like **Prisma Migrate** cannot detect column renames automatic
 
 ---
 
-## 📊 PostgreSQL Lock Hierarchy Reference
+## PostgreSQL Lock Hierarchy Reference
 
 | Lock Mode | Acquired By | Conflicted Locks | Blocks Reads? | Blocks Writes? | Risk Level |
 |:---|:---|:---|:---:|:---:|:---:|
@@ -43,7 +43,7 @@ Furthermore, ORMs like **Prisma Migrate** cannot detect column renames automatic
 
 ---
 
-## 룰 The 7 Core Rules & Zero-Downtime Recipes
+## The 7 Core Rules & Zero-Downtime Recipes
 
 ### 1. `require-concurrent-index` (CREATE INDEX without CONCURRENTLY)
 - **Severity**: `BLOCKER`
@@ -174,7 +174,7 @@ Furthermore, ORMs like **Prisma Migrate** cannot detect column renames automatic
 
 ---
 
-## 🚀 CLI Installation & Usage
+## CLI Installation & Usage
 
 ### Running via npx (Zero Install)
 ```bash
@@ -219,7 +219,7 @@ npx ddlforge ./migrations --quiet
 
 ---
 
-## 🤖 GitHub Actions Workflow
+## GitHub Actions Workflow
 
 Add this copy-paste workflow to `.github/workflows/migration-lint.yml`:
 
@@ -262,7 +262,7 @@ jobs:
 
 ---
 
-## 💻 Programmatic TypeScript API
+## Programmatic TypeScript API
 
 You can also use `ddlforge` programmatically within your custom deployment scripts:
 
@@ -287,7 +287,7 @@ if (result.hasBlockers) {
 
 ---
 
-## ⚙️ Inline Directives
+## Inline Directives
 
 You can suppress specific rules per statement using inline comments:
 
@@ -307,7 +307,7 @@ CREATE INDEX CONCURRENTLY "users_email_idx" ON "users"("email");
 
 ---
 
-## 🧪 Testing & Verification
+## Testing & Verification
 
 Run the native test suite:
 ```bash
@@ -321,6 +321,6 @@ Performance benchmark:
 
 ---
 
-## 📄 License
+## License
 
-MIT © [ddlforge](https://github.com/ddlforge/ddlforge)
+MIT © [x7sss](https://github.com/x7ssss)

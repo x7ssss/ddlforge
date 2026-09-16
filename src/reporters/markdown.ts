@@ -78,7 +78,7 @@ export function formatMarkdown(results: AnalysisResult[]): string {
   }
 
   lines.push('---');
-  lines.push('*Automated by [ddlforge](https://github.com/ddlforge/ddlforge) — Zero-runtime-dependency Postgres Lock Linter*');
+  lines.push('*Automated by [ddlforge](https://github.com/x7ssss/ddlforge) — Zero-runtime-dependency Postgres Lock Linter*');
 
   return lines.join('\n');
 }
