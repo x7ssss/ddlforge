@@ -1,0 +1,4 @@
+-- Safe: Nullable column addition and NOT NULL column with DEFAULT
+ALTER TABLE users ADD COLUMN bio TEXT;
+ALTER TABLE users ADD COLUMN status VARCHAR(20) DEFAULT 'active' NOT NULL;
+ALTER TABLE users ADD COLUMN score INT GENERATED ALWAYS AS IDENTITY;

@@ -1,0 +1,41 @@
+{
+  "name": "ddlforge",
+  "version": "1.0.0",
+  "description": "Ultra-fast, zero-runtime-dependency Postgres migration lock linter and data-loss prevention engine CLI in Node.js 20+ and TypeScript",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "ddlforge": "./dist/bin/ddlforge.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"const fs=require('fs'); try{fs.chmodSync('dist/bin/ddlforge.js', 0o755)}catch{}\"",
+    "test": "npm run build && node --test dist/test/analyzer.test.js",
+    "test:watch": "node --test --watch dist/test/analyzer.test.js"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "migration",
+    "ddl",
+    "lock",
+    "linter",
+    "prisma",
+    "drizzle",
+    "zero-downtime"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.8.2"
+  }
+}
