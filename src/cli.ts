@@ -9,6 +9,8 @@ import { MigrationAnalyzer, AnalysisResult } from './engine/analyzer.js';
 import { formatTerminal } from './reporters/terminal.js';
 import { formatJson } from './reporters/json.js';
 import { formatMarkdown } from './reporters/markdown.js';
+// executor is imported dynamically inside runApply() to preserve
+// zero-dependency invariant for static linting (ddlforge check).
 
 export interface CliOptions {
   targets: string[];
@@ -20,7 +22,20 @@ export interface CliOptions {
   version: boolean;
 }
 
-export const VERSION = '0.1.0';
+/** Options parsed from `ddlforge apply <file> --db <url> [flags]` */
+export interface ApplyOptions {
+  file: string;
+  databaseUrl: string;
+  lockTimeout: string;
+  statementTimeout: string;
+  maxRetries: number;
+  dryRun: boolean;
+  lockQueueThreshold: number;
+  monitorPollMs: number;
+  help: boolean;
+}
+
+export const VERSION = '0.2.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -111,8 +126,10 @@ export function printHelp(): void {
 ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock linter
 
 USAGE:
-  ddlforge [paths...] [flags]
+  ddlforge [paths...] [flags]              # lint/check migrations
+  ddlforge apply <file.sql> --db <url>     # apply a migration safely
 
+── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
   paths               Target migration files or directories (e.g. ./prisma/migrations, ./drizzle)
 
@@ -124,13 +141,152 @@ FLAGS:
   --version, -v       Print ddlforge version and exit
   --help, -h          Print this help message and exit
 
+── APPLY (execute) ───────────────────────────────────────────────────
+  ddlforge apply <file.sql> --db <DATABASE_URL> [flags]
+
+ARGUMENTS:
+  <file.sql>                  SQL migration file to execute
+
+FLAGS:
+  --db <url>                  PostgreSQL connection URL (required)
+  --lock-timeout <ms>         Per-statement lock_timeout in milliseconds (default: 3000)
+  --statement-timeout <ms>    Per-statement statement_timeout in milliseconds (default: 30000)
+  --max-retries <n>           Maximum retry attempts on lock timeout (default: 5)
+  --dry-run                   Parse and display statements without executing
+  --lock-queue-threshold <n>  Blocked-backend count that triggers cancellation (default: 1)
+  --monitor-poll-ms <ms>      Lock-monitor polling interval in milliseconds (default: 500)
+  --help, -h                  Print this help message and exit
+
 EXAMPLES:
   $ ddlforge ./prisma/migrations
   $ ddlforge ./drizzle --pg 14 --format json
   $ ddlforge --changed-only
   $ ddlforge ./migrations/001_add_index.sql
+  $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb
+  $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb --dry-run
+  $ ddlforge apply ./migrations/001_add_index.sql --db \$DATABASE_URL --lock-timeout 5000 --max-retries 3
 `);
 }
+
+/**
+ * Parses arguments for the `apply` subcommand.
+ * argv should be the args AFTER the "apply" token.
+ */
+export function parseApplyArgs(argv: string[]): ApplyOptions {
+  const opts: ApplyOptions = {
+    file:               '',
+    databaseUrl:        process.env['DATABASE_URL'] ?? '',
+    lockTimeout:        '3000ms',
+    statementTimeout:   '30000ms',
+    maxRetries:         5,
+    dryRun:             false,
+    lockQueueThreshold: 1,
+    monitorPollMs:      500,
+    help:               false,
+  };
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      opts.help = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--dry-run') {
+      opts.dryRun = true;
+      i++;
+      continue;
+    }
+
+    const nextArg = (): string => {
+      i++;
+      return i < argv.length ? argv[i] : '';
+    };
+
+    if (arg === '--db' || arg === '--database-url') {
+      opts.databaseUrl = nextArg();
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      opts.databaseUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--lock-timeout') {
+      const val = nextArg();
+      opts.lockTimeout = val.endsWith('ms') ? val : `${val}ms`;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--lock-timeout=')) {
+      const val = arg.slice('--lock-timeout='.length);
+      opts.lockTimeout = val.endsWith('ms') ? val : `${val}ms`;
+      i++;
+      continue;
+    }
+
+    if (arg === '--statement-timeout') {
+      const val = nextArg();
+      opts.statementTimeout = val.endsWith('ms') ? val : `${val}ms`;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--statement-timeout=')) {
+      const val = arg.slice('--statement-timeout='.length);
+      opts.statementTimeout = val.endsWith('ms') ? val : `${val}ms`;
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-retries') {
+      opts.maxRetries = parseInt(nextArg(), 10) || 5;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-retries=')) {
+      opts.maxRetries = parseInt(arg.slice('--max-retries='.length), 10) || 5;
+      i++;
+      continue;
+    }
+
+    if (arg === '--lock-queue-threshold') {
+      opts.lockQueueThreshold = parseInt(nextArg(), 10) || 1;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--lock-queue-threshold=')) {
+      opts.lockQueueThreshold = parseInt(arg.slice('--lock-queue-threshold='.length), 10) || 1;
+      i++;
+      continue;
+    }
+
+    if (arg === '--monitor-poll-ms') {
+      opts.monitorPollMs = parseInt(nextArg(), 10) || 500;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--monitor-poll-ms=')) {
+      opts.monitorPollMs = parseInt(arg.slice('--monitor-poll-ms='.length), 10) || 500;
+      i++;
+      continue;
+    }
+
+    // Positional: the SQL file
+    if (!arg.startsWith('-') && opts.file === '') {
+      opts.file = arg;
+    }
+
+    i++;
+  }
+
+  return opts;
+}
+
 
 /**
  * Finds all .sql files from input paths, directories, or defaults.
@@ -240,6 +396,11 @@ function getChangedSqlFiles(cwd: string): string[] {
 }
 
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<number> {
+  // Detect apply subcommand
+  if (argv[0] === 'apply') {
+    return runApply(argv.slice(1));
+  }
+
   const options = parseArgs(argv);
 
   if (options.help) {
@@ -292,4 +453,154 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
 
   const hasBlockers = results.some(r => r.hasBlockers);
   return hasBlockers ? 1 : 0;
+}
+
+/**
+ * Executes the `ddlforge apply` subcommand.
+ *
+ * Imports executor dynamically to preserve zero-dependency
+ * invariant for static linting paths.
+ */
+export async function runApply(argv: string[]): Promise<number> {
+  const opts = parseApplyArgs(argv);
+
+  if (opts.help) {
+    printHelp();
+    return 0;
+  }
+
+  if (!opts.file) {
+    console.error('ddlforge apply: <file.sql> argument is required.');
+    console.error('Usage: ddlforge apply <file.sql> --db <DATABASE_URL>');
+    return 1;
+  }
+
+  if (!opts.databaseUrl) {
+    console.error('ddlforge apply: --db <DATABASE_URL> is required (or set DATABASE_URL env var).');
+    return 1;
+  }
+
+  const filePath = path.isAbsolute(opts.file)
+    ? opts.file
+    : path.resolve(process.cwd(), opts.file);
+
+  if (!fs.existsSync(filePath)) {
+    console.error(`ddlforge apply: File not found: ${filePath}`);
+    return 1;
+  }
+
+  const sql = fs.readFileSync(filePath, 'utf-8');
+
+  // Color support
+  const useColor = !process.env['NO_COLOR'] && !process.env['NODE_DISABLE_COLORS']
+    && (process.env['FORCE_COLOR'] || process.stdout.isTTY);
+
+  const c = {
+    reset:   useColor ? '\x1b[0m'    : '',
+    bold:    useColor ? '\x1b[1m'    : '',
+    dim:     useColor ? '\x1b[2m'    : '',
+    red:     useColor ? '\x1b[31m'   : '',
+    green:   useColor ? '\x1b[32m'   : '',
+    yellow:  useColor ? '\x1b[33m'   : '',
+    cyan:    useColor ? '\x1b[36m'   : '',
+    gray:    useColor ? '\x1b[90m'   : '',
+    bgGreen: useColor ? '\x1b[42m\x1b[30m' : '',
+    bgRed:   useColor ? '\x1b[41m\x1b[37m' : '',
+  };
+
+  if (opts.dryRun) {
+    console.log(`\n${c.cyan}${c.bold}ddlforge apply --dry-run${c.reset} ${c.gray}${filePath}${c.reset}\n`);
+  } else {
+    console.log(`\n${c.cyan}${c.bold}ddlforge apply${c.reset} ${c.gray}${filePath}${c.reset}`);
+    console.log(`${c.dim}  lock_timeout:      ${opts.lockTimeout}${c.reset}`);
+    console.log(`${c.dim}  statement_timeout: ${opts.statementTimeout}${c.reset}`);
+    console.log(`${c.dim}  max_retries:       ${opts.maxRetries}${c.reset}`);
+    console.log(`${c.dim}  queue_threshold:   ${opts.lockQueueThreshold}${c.reset}`);
+    console.log('');
+  }
+
+  // Dynamic import of executor (pg not in static import graph)
+  type ExecutorModule = typeof import('./runner/executor.js');
+  const { executeMigration } = await import('./runner/executor.js') as ExecutorModule;
+
+  const startTime = Date.now();
+
+  const result = await executeMigration(sql, {
+    databaseUrl:        opts.databaseUrl,
+    lockTimeout:        opts.lockTimeout,
+    statementTimeout:   opts.statementTimeout,
+    maxRetries:         opts.maxRetries,
+    dryRun:             opts.dryRun,
+    lockQueueThreshold: opts.lockQueueThreshold,
+    monitorPollMs:      opts.monitorPollMs,
+    onProgress(event) {
+      const idx    = event.statementIndex + 1;
+      const total  = event.totalStatements;
+      const prefix = `  [${String(idx).padStart(String(total).length, ' ')}/${total}]`;
+      const snippet = event.statementSql.length > 72
+        ? event.statementSql.slice(0, 69) + '...'
+        : event.statementSql;
+
+      switch (event.kind) {
+        case 'dry-run-statement':
+          console.log(`${c.gray}${prefix}${c.reset} ${c.dim}${snippet}${c.reset}`);
+          break;
+        case 'statement-start':
+          process.stdout.write(
+            `${c.dim}${prefix}${c.reset} ${snippet} ${c.gray}…${c.reset}`
+          );
+          break;
+        case 'statement-success':
+          process.stdout.write(
+            `\r${c.green}${prefix}${c.reset} ${snippet} ` +
+            `${c.green}✔${c.reset} ${c.gray}(${event.elapsedMs}ms)${c.reset}\n`
+          );
+          break;
+        case 'statement-retry':
+          process.stdout.write(
+            `\r${c.yellow}${prefix}${c.reset} ${snippet} ` +
+            `${c.yellow}↺ retry ${event.attempt}${c.reset} ` +
+            `${c.gray}(backoff ${Math.round(event.retryBackoffMs ?? 0)}ms)${c.reset}\n`
+          );
+          break;
+        case 'statement-failed':
+          process.stdout.write(
+            `\r${c.red}${prefix}${c.reset} ${snippet} ` +
+            `${c.red}✖ failed${c.reset}\n`
+          );
+          if (event.error) {
+            console.log(`     ${c.red}${event.error}${c.reset}`);
+          }
+          break;
+        case 'avalanche-abort':
+          console.log(`\n  ${c.bgRed} AVALANCHE ABORT ${c.reset} ${c.red}${event.error}${c.reset}\n`);
+          break;
+        case 'migration-complete':
+        case 'migration-failed':
+          // handled below after executeMigration returns
+          break;
+      }
+    },
+  });
+
+  const elapsed = Date.now() - startTime;
+
+  console.log('');
+  console.log(c.gray + '━'.repeat(70) + c.reset);
+
+  if (result.success) {
+    console.log(
+      `${c.bgGreen} APPLIED ${c.reset} ` +
+      `${c.green}${c.bold}${result.statementsExecuted}/${result.statementsTotal} statement(s)${c.reset} ` +
+      `executed successfully in ${elapsed}ms`
+    );
+    return 0;
+  } else {
+    console.log(
+      `${c.bgRed} FAILED ${c.reset} ` +
+      `${c.red}${c.bold}${result.statementsExecuted}/${result.statementsTotal} statement(s) applied${c.reset}` +
+      (result.error ? `\n  ${c.red}${result.error}${c.reset}` : '')
+    );
+    return 1;
+  }
 }
