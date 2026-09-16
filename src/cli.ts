@@ -20,7 +20,7 @@ export interface CliOptions {
   version: boolean;
 }
 
-export const VERSION = '1.0.0';
+export const VERSION = '0.1.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
