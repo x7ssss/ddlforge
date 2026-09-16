@@ -6,14 +6,23 @@
  * 1. Dynamically imports `pg` at runtime (graceful error if not installed).
  * 2. Parses SQL migration files into individual statements (reuses the existing
  *    zero-dependency lexer — no duplicate parser code).
- * 3. For each statement:
- *    a. Opens a transaction on a fresh client.
- *    b. Injects `SET LOCAL lock_timeout` and `SET LOCAL statement_timeout`.
- *    c. Executes the statement.
- *    d. On error 55P03 (lock_not_available) or 57014 (query_canceled):
- *       – Rolls back, waits for a full-jitter backoff interval, retries.
- *    e. On avalanche detected by the lock monitor: rolls back and aborts.
- *    f. On success: commits and proceeds to the next statement.
+ * 3. For each statement, selects one of two execution paths:
+ *
+ *    a. **Non-transactional path** (CREATE/DROP INDEX CONCURRENTLY, REINDEX
+ *       CONCURRENTLY, VACUUM):
+ *       – Sets session-level `lock_timeout` / `statement_timeout`.
+ *       – Executes the statement outside any transaction block.
+ *       – Always RESETs the session timeouts in a `finally` block.
+ *
+ *    b. **Transactional path** (all other statements):
+ *       – Opens a transaction with `BEGIN`.
+ *       – Injects `SET LOCAL lock_timeout` and `SET LOCAL statement_timeout`.
+ *       – Executes the statement.
+ *       – On error 55P03 (lock_not_available) or 57014 (query_canceled):
+ *         Rolls back, waits for a full-jitter backoff interval, retries.
+ *       – On avalanche detected by the lock monitor: rolls back and aborts.
+ *       – On success: commits and proceeds to the next statement.
+ *
  * 4. Reports live progress via an optional EventEmitter-compatible callback.
  *
  * Zero-dependency invariant
@@ -167,6 +176,30 @@ function pgErrorCode(err: unknown): string {
     return String((err as Record<string, unknown>)['code'] ?? '');
   }
   return '';
+}
+
+/**
+ * Returns true for statements that PostgreSQL forbids inside a transaction
+ * block and must therefore run outside BEGIN … COMMIT:
+ *  - CREATE INDEX CONCURRENTLY
+ *  - CREATE UNIQUE INDEX CONCURRENTLY
+ *  - DROP INDEX CONCURRENTLY
+ *  - REINDEX … CONCURRENTLY
+ *  - VACUUM (any form)
+ *
+ * Detection is intentionally conservative: we normalise whitespace and
+ * uppercase the first ~120 characters so that leading comments or extra
+ * spaces never cause a false negative.
+ */
+export function isConcurrentStatement(sql: string): boolean {
+  // Strip leading whitespace / line comments and take the first ~120 chars.
+  const head = sql.trimStart().slice(0, 120).replace(/\s+/g, ' ').toUpperCase();
+
+  if (/^CREATE(\s+UNIQUE)?\s+INDEX\s+CONCURRENTLY\b/.test(head)) return true;
+  if (/^DROP\s+INDEX\s+CONCURRENTLY\b/.test(head)) return true;
+  if (/^REINDEX\b/.test(head) && head.includes('CONCURRENTLY')) return true;
+  if (/^VACUUM\b/.test(head)) return true;
+  return false;
 }
 
 /* ------------------------------------------------------------------ */
@@ -334,71 +367,143 @@ export async function executeMigration(
             })
           : null;
 
-        try {
-          // Open transaction
-          await client.query('BEGIN');
+        const isConcurrent = isConcurrentStatement(stmtSql);
 
-          // Inject session-local timeouts (scoped to this transaction)
-          await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}'`);
-          await client.query(`SET LOCAL statement_timeout = '${statementTimeoutMs}'`);
+        if (isConcurrent) {
+          // ── Non-transactional path (CONCURRENTLY / VACUUM) ─────────────
+          // PostgreSQL forbids these inside a transaction block.
+          // Apply session-level timeouts instead of transaction-local ones
+          // and always RESET them in the finally block.
+          try {
+            await client.query(`SET lock_timeout = '${lockTimeoutMs}'`);
+            await client.query(`SET statement_timeout = '${statementTimeoutMs}'`);
 
-          // Execute the DDL statement
-          await client.query(stmtSql);
+            // Execute the statement outside any transaction
+            await client.query(stmtSql);
 
-          // Commit
-          await client.query('COMMIT');
+            // Stop monitor — execution succeeded, no avalanche
+            monitor?.stop();
+            const monResult = await monitor?.result;
+            if (monResult?.avalanche) {
+              // Race: monitor fired just as the statement completed.
+              // Statement already succeeded so treat as success.
+            }
 
-          // Stop monitor — execution succeeded, no avalanche
-          monitor?.stop();
-          const monResult = await monitor?.result;
-          if (monResult?.avalanche) {
-            // Race condition: monitor fired just as we committed.
-            // The COMMIT succeeded so we treat this as a success.
-            // (pg_cancel_backend after COMMIT is a no-op.)
-          }
+            succeeded = true;
+            stmtError = undefined;
+            break; // exit retry loop
 
-          succeeded = true;
-          stmtError = undefined;
-          break; // exit retry loop
+          } catch (err: unknown) {
+            const code = pgErrorCode(err);
 
-        } catch (err: unknown) {
-          const code = pgErrorCode(err);
+            // Stop monitor before doing anything else
+            monitor?.stop();
+            const monResult = await monitor?.result;
 
-          // Stop monitor before doing anything else
-          monitor?.stop();
-          const monResult = await monitor?.result;
+            // No transaction to roll back for concurrent statements.
 
-          // Rollback the failed transaction
-          try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+            if (monResult?.avalanche) {
+              // Lock-queue avalanche: abort the entire migration
+              onProgress?.({
+                kind:            'avalanche-abort',
+                statementIndex:  i,
+                totalStatements: total,
+                statementSql:    stmtSql,
+                attempt,
+                elapsedMs:       Date.now() - migrationStart,
+                error:           `Lock-queue avalanche: ${monResult.blockedCount} backend(s) queued. Cancelled at ${monResult.cancelledAt}.`,
+              });
+              globalError = `Lock-queue avalanche detected. ${monResult.blockedCount} backend(s) were waiting behind migration PID ${migrationPid}. Migration aborted to protect connection pool.`;
+              avalanche   = true;
+              break;
+            }
 
-          if (monResult?.avalanche) {
-            // Lock-queue avalanche: abort the entire migration
-            onProgress?.({
-              kind:            'avalanche-abort',
-              statementIndex:  i,
-              totalStatements: total,
-              statementSql:    stmtSql,
-              attempt,
-              elapsedMs:       Date.now() - migrationStart,
-              error:           `Lock-queue avalanche: ${monResult.blockedCount} backend(s) queued. Cancelled at ${monResult.cancelledAt}.`,
-            });
-            globalError = `Lock-queue avalanche detected. ${monResult.blockedCount} backend(s) were waiting behind migration PID ${migrationPid}. Migration aborted to protect connection pool.`;
-            avalanche   = true;
+            if (isLockError(code) && attempt < maxRetries) {
+              // Retryable lock error — continue retry loop
+              stmtError = `[${code}] ${(err as Error).message ?? String(err)}`;
+              continue;
+            }
+
+            // Non-retryable error or max retries exhausted
+            stmtError = `[${code || 'ERR'}] ${(err as Error).message ?? String(err)}`;
             break;
+
+          } finally {
+            // Always reset session-level timeouts so the connection is
+            // returned to the pool in a clean state.
+            try { await client.query('RESET lock_timeout'); } catch { /* ignore */ }
+            try { await client.query('RESET statement_timeout'); } catch { /* ignore */ }
+            client.release?.();
           }
 
-          if (isLockError(code) && attempt < maxRetries) {
-            // Retryable lock error — continue retry loop
-            stmtError = `[${code}] ${(err as Error).message ?? String(err)}`;
-            continue;
+        } else {
+          // ── Transactional path (all other DDL / DML) ────────────────────
+          try {
+            // Open transaction
+            await client.query('BEGIN');
+
+            // Inject session-local timeouts (scoped to this transaction)
+            await client.query(`SET LOCAL lock_timeout = '${lockTimeoutMs}'`);
+            await client.query(`SET LOCAL statement_timeout = '${statementTimeoutMs}'`);
+
+            // Execute the DDL statement
+            await client.query(stmtSql);
+
+            // Commit
+            await client.query('COMMIT');
+
+            // Stop monitor — execution succeeded, no avalanche
+            monitor?.stop();
+            const monResult = await monitor?.result;
+            if (monResult?.avalanche) {
+              // Race condition: monitor fired just as we committed.
+              // The COMMIT succeeded so we treat this as a success.
+              // (pg_cancel_backend after COMMIT is a no-op.)
+            }
+
+            succeeded = true;
+            stmtError = undefined;
+            break; // exit retry loop
+
+          } catch (err: unknown) {
+            const code = pgErrorCode(err);
+
+            // Stop monitor before doing anything else
+            monitor?.stop();
+            const monResult = await monitor?.result;
+
+            // Rollback the failed transaction
+            try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+
+            if (monResult?.avalanche) {
+              // Lock-queue avalanche: abort the entire migration
+              onProgress?.({
+                kind:            'avalanche-abort',
+                statementIndex:  i,
+                totalStatements: total,
+                statementSql:    stmtSql,
+                attempt,
+                elapsedMs:       Date.now() - migrationStart,
+                error:           `Lock-queue avalanche: ${monResult.blockedCount} backend(s) queued. Cancelled at ${monResult.cancelledAt}.`,
+              });
+              globalError = `Lock-queue avalanche detected. ${monResult.blockedCount} backend(s) were waiting behind migration PID ${migrationPid}. Migration aborted to protect connection pool.`;
+              avalanche   = true;
+              break;
+            }
+
+            if (isLockError(code) && attempt < maxRetries) {
+              // Retryable lock error — continue retry loop
+              stmtError = `[${code}] ${(err as Error).message ?? String(err)}`;
+              continue;
+            }
+
+            // Non-retryable error or max retries exhausted
+            stmtError = `[${code || 'ERR'}] ${(err as Error).message ?? String(err)}`;
+            break;
+
+          } finally {
+            client.release?.();
           }
-
-          // Non-retryable error or max retries exhausted
-          stmtError = `[${code || 'ERR'}] ${(err as Error).message ?? String(err)}`;
-          break;
-
-        } finally {
-          client.release?.();
         }
       } // end retry loop
 

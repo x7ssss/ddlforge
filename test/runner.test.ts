@@ -26,6 +26,7 @@ import {
 
 import {
   parseMigrationStatements,
+  isConcurrentStatement,
 } from '../src/runner/executor.js';
 
 /* ──────────────────────────────────────────────────────────────────── */
@@ -251,6 +252,98 @@ describe('startLockMonitor()', () => {
 
     const res = await result;
     assert.ok(res.stopReason === 'aborted' || res.stopReason === 'external-stop');
+  });
+});
+
+/* ──────────────────────────────────────────────────────────────────── */
+/* isConcurrentStatement — transaction-isolation classifier             */
+/* ──────────────────────────────────────────────────────────────────── */
+
+describe('isConcurrentStatement()', () => {
+  // ── Positive cases — must run OUTSIDE a transaction block ──────────
+  it('detects CREATE INDEX CONCURRENTLY', () => {
+    assert.strictEqual(
+      isConcurrentStatement('CREATE INDEX CONCURRENTLY idx ON t(col);'),
+      true,
+    );
+  });
+
+  it('detects CREATE UNIQUE INDEX CONCURRENTLY', () => {
+    assert.strictEqual(
+      isConcurrentStatement('CREATE UNIQUE INDEX CONCURRENTLY idx_u ON t(col);'),
+      true,
+    );
+  });
+
+  it('detects DROP INDEX CONCURRENTLY', () => {
+    assert.strictEqual(
+      isConcurrentStatement('DROP INDEX CONCURRENTLY idx;'),
+      true,
+    );
+  });
+
+  it('detects REINDEX … CONCURRENTLY', () => {
+    assert.strictEqual(
+      isConcurrentStatement('REINDEX TABLE CONCURRENTLY my_table;'),
+      true,
+    );
+    assert.strictEqual(
+      isConcurrentStatement('REINDEX INDEX CONCURRENTLY idx_foo;'),
+      true,
+    );
+  });
+
+  it('detects VACUUM (any form)', () => {
+    assert.strictEqual(isConcurrentStatement('VACUUM;'), true);
+    assert.strictEqual(isConcurrentStatement('VACUUM ANALYZE users;'), true);
+    assert.strictEqual(isConcurrentStatement('VACUUM FULL users;'), true);
+  });
+
+  it('is case-insensitive and whitespace-tolerant', () => {
+    assert.strictEqual(
+      isConcurrentStatement('  create   index   concurrently   idx ON t(x);'),
+      true,
+    );
+    assert.strictEqual(
+      isConcurrentStatement('  vacuum   analyze   users;'),
+      true,
+    );
+  });
+
+  // ── Negative cases — must run INSIDE a transaction block ───────────
+  it('returns false for CREATE INDEX (non-concurrent)', () => {
+    assert.strictEqual(
+      isConcurrentStatement('CREATE INDEX idx ON t(col);'),
+      false,
+    );
+  });
+
+  it('returns false for DROP INDEX (non-concurrent)', () => {
+    assert.strictEqual(
+      isConcurrentStatement('DROP INDEX idx;'),
+      false,
+    );
+  });
+
+  it('returns false for ALTER TABLE', () => {
+    assert.strictEqual(
+      isConcurrentStatement('ALTER TABLE users ADD COLUMN bio TEXT;'),
+      false,
+    );
+  });
+
+  it('returns false for CREATE TABLE', () => {
+    assert.strictEqual(
+      isConcurrentStatement('CREATE TABLE users (id INT);'),
+      false,
+    );
+  });
+
+  it('returns false for plain REINDEX without CONCURRENTLY', () => {
+    assert.strictEqual(
+      isConcurrentStatement('REINDEX TABLE my_table;'),
+      false,
+    );
   });
 });
 
