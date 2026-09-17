@@ -417,7 +417,14 @@ export function spawnCommand(command: string[], cwd: string = process.cwd()): Pr
       });
     }
 
+    const onSIGINT  = () => { child.kill('SIGINT');  process.exit(130); };
+    const onSIGTERM = () => { child.kill('SIGTERM'); process.exit(143); };
+    process.once('SIGINT',  onSIGINT);
+    process.once('SIGTERM', onSIGTERM);
+
     child.on('close', (code, signal) => {
+      process.off('SIGINT',  onSIGINT);
+      process.off('SIGTERM', onSIGTERM);
       if (signal) {
         resolve(1);
       } else {
@@ -426,6 +433,8 @@ export function spawnCommand(command: string[], cwd: string = process.cwd()): Pr
     });
 
     child.on('error', (err) => {
+      process.off('SIGINT',  onSIGINT);
+      process.off('SIGTERM', onSIGTERM);
       console.error(`[ddlforge wrap] Failed to execute command "${command.join(' ')}": ${err.message}`);
       resolve(1);
     });

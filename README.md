@@ -6,7 +6,7 @@
 [![npm version](https://img.shields.io/badge/npm-v0.5.0-blue.svg)](package.json)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5%2B-blue.svg)](https://www.typescriptlang.org)
-[![Tests](https://img.shields.io/badge/Tests-132%20passing-brightgreen.svg)](test)
+[![Tests](https://img.shields.io/badge/Tests-240%20passing-brightgreen.svg)](test)
 [![Zero Dependencies](https://img.shields.io/badge/Check%20Deps-0-success.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/x7sss)
@@ -191,6 +191,9 @@ npx ddlforge apply ./migrations/001_add_index.sql \
 | `set-not-null-full-scan`<br>`(set-not-null-full-scan)` | `ACCESS EXCLUSIVE` | **WARNING** (PG 12+)<br>**BLOCKER** (PG < 12) | Direct `ALTER COLUMN ... SET NOT NULL` forces synchronous full table scan under exclusive lock. | Add `CHECK (col IS NOT NULL) NOT VALID`, validate constraint, then apply `SET NOT NULL`. |
 | `unbatched-dml`<br>`(unbatched-backfill)` | `ROW EXCLUSIVE` | **BLOCKER** (no `WHERE`)<br>**WARNING** (with `WHERE`) | Massive single-transaction `UPDATE`/`DELETE` generates heavy WAL bloat and lock convoys. | Batch in small slices (1,000–5,000 rows) via background jobs or add ignore directive. |
 | `session-advisory-lock`<br>`(session-advisory-lock)` | `NONE` | **WARNING** | `pg_advisory_lock` leaks across connections in poolers (PgBouncer transaction mode). | Replace with transaction-scoped variants: `pg_advisory_xact_lock(...)`. |
+| `alter-column-type-rewrite`<br>`(alter-column-type-rewrite)` | `ACCESS EXCLUSIVE` | **BLOCKER** (rewrites)<br>**WARNING** (metadata-only) | `ALTER TABLE ... ALTER COLUMN ... TYPE` causes full physical table rewrite under `ACCESS EXCLUSIVE` lock in most cases. | 1. `ADD COLUMN col_new <new_type>;`<br>2. Backfill in batches.<br>3. In transaction: `RENAME COLUMN col TO col_old; RENAME COLUMN col_new TO col;`<br>4. `DROP COLUMN col_old;` |
+| `unindexed-foreign-key`<br>`(unindexed-foreign-key)` | `NONE` | **WARNING** | Adding `FOREIGN KEY` without covering index on referencing columns causes sequential scan locks during parent updates/deletes. | 1. `CREATE INDEX CONCURRENTLY idx ON t(fk_cols);`<br>2. `ADD CONSTRAINT fk FOREIGN KEY (...) NOT VALID;`<br>3. `VALIDATE CONSTRAINT fk;` |
+| `drop-column-lock`<br>`(drop-column-lock)` | `ACCESS EXCLUSIVE` | **WARNING** | `DROP COLUMN` holds `ACCESS EXCLUSIVE` lock on the table, blocking all concurrent read and write operations. | 1. Deploy app code that stops reading/writing the column first.<br>2. Drop column in low-traffic maintenance window. |
 
 ---
 
@@ -233,6 +236,47 @@ ALTER TABLE "users" ADD COLUMN "name" TEXT NOT NULL;
 
 -- ✅ Safe: Rename in place without data loss
 ALTER TABLE "users" RENAME COLUMN "full_name" TO "name";
+```
+
+### 5. `alter-column-type-rewrite`
+```sql
+-- ❌ Dangerous: Full physical table rewrite under ACCESS EXCLUSIVE
+ALTER TABLE users ALTER COLUMN age TYPE bigint;
+
+-- ✅ Safe: Expand-and-contract zero-downtime migration pattern
+-- 1. Add new column with desired type
+ALTER TABLE users ADD COLUMN age_bigint bigint;
+-- 2. Backfill in batches (application dual-writes during transition)
+-- 3. Atomically swap column names in a fast transaction
+BEGIN;
+ALTER TABLE users RENAME COLUMN age TO age_old;
+ALTER TABLE users RENAME COLUMN age_bigint TO age;
+COMMIT;
+-- 4. Drop old column after verifying correctness
+ALTER TABLE users DROP COLUMN age_old;
+
+-- ℹ️ Metadata-only safe exception:
+-- Increasing varchar length (e.g. varchar(50) -> varchar(100)) or converting
+-- varchar(N) -> text is catalog-only in PostgreSQL 9.2+ and does not rewrite data.
+```
+
+### 6. `unindexed-foreign-key`
+```sql
+-- ❌ Dangerous: Missing covering index causes table scan locks on parent row deletes/updates
+ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+
+-- ✅ Safe: Pre-create covering index concurrently before adding constraint
+CREATE INDEX CONCURRENTLY idx_orders_user_id ON orders (user_id);
+ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) NOT VALID;
+ALTER TABLE orders VALIDATE CONSTRAINT fk_user;
+```
+
+### 7. `drop-column-lock`
+```sql
+-- ⚠️ Caution: Acquires ACCESS EXCLUSIVE lock; must be decoupled from active application code
+-- 1. Release application code that no longer selects or writes the column.
+-- 2. Once old code is fully drained, drop column in a scheduled maintenance window:
+ALTER TABLE users DROP COLUMN deprecated_field;
 ```
 
 ---

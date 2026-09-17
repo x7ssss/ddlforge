@@ -1,6 +1,8 @@
 /**
- * ddlforge - Unit tests for rules 8, 9, 10 (check-constraint-not-valid,
- * unique-constraint-using-index, session-advisory-lock) and fixture verification.
+ * ddlforge - Unit tests for rules 8–13 (check-constraint-not-valid,
+ * unique-constraint-using-index, session-advisory-lock,
+ * alter-column-type-rewrite, unindexed-foreign-key, drop-column-lock)
+ * and fixture verification.
  */
 
 import { describe, it } from 'node:test';
@@ -13,6 +15,9 @@ import {
   checkConstraintNotValidRule,
   uniqueConstraintUsingIndexRule,
   sessionAdvisoryLockRule,
+  alterColumnTypeRewriteRule,
+  unindexedForeignKeyRule,
+  dropColumnLockRule,
 } from '../src/rules/index.js';
 
 // ---------------------------------------------------------------------------
@@ -172,4 +177,216 @@ describe('Fixture Verification: v0.3.0 safe fixtures', () => {
       assert.strictEqual(res.blockersCount, 0, `Unexpected blockers in ${fixture}`);
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Rule 11: alterColumnTypeRewrite (alter-column-type-rewrite)
+// ---------------------------------------------------------------------------
+
+describe('Rule 11: alterColumnTypeRewrite (alter-column-type-rewrite)', () => {
+  it('detects ALTER COLUMN TYPE text as BLOCKER with ACCESS EXCLUSIVE lock', () => {
+    const sql = 'ALTER TABLE users ALTER COLUMN email TYPE text;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    const f = res.findings[0];
+    assert.strictEqual(f.ruleId, 'alter-column-type-rewrite');
+    assert.strictEqual(f.severity, 'BLOCKER');
+    assert.ok(f.message.includes('"email"'));
+    assert.ok(f.message.includes('"users"'));
+    assert.ok(f.suggestion.includes('ADD COLUMN'));
+    assert.ok(f.suggestion.includes('RENAME COLUMN'));
+  });
+
+  it('detects ALTER COLUMN TYPE bigint as BLOCKER', () => {
+    const sql = 'ALTER TABLE users ALTER COLUMN age TYPE bigint;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    const f = res.findings[0];
+    assert.ok(f.message.includes('"age"'));
+    assert.ok(f.message.includes('"users"'));
+  });
+
+  it('detects ALTER COLUMN TYPE varchar(200) as BLOCKER', () => {
+    const sql = 'ALTER TABLE users ALTER COLUMN name TYPE varchar(200);';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    assert.ok(res.findings[0].message.includes('"name"'));
+  });
+
+  it('passes ALTER TABLE ... ADD COLUMN (not ALTER COLUMN TYPE)', () => {
+    const sql = 'ALTER TABLE users ADD COLUMN foo text;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.findings.length, 0);
+  });
+
+  it('passes when ignored with directive comment', () => {
+    const sql = `-- ddlforge-ignore alter-column-type-rewrite\nALTER TABLE users ALTER COLUMN email TYPE text;`;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.findings.length, 0);
+  });
+
+  it('detects SET DATA TYPE variant as BLOCKER', () => {
+    const sql = 'ALTER TABLE t ALTER COLUMN c SET DATA TYPE jsonb;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    const f = res.findings[0];
+    assert.ok(f.message.includes('"c"'));
+    assert.ok(f.message.includes('"t"'));
+  });
+
+  it('detects with IF EXISTS modifier on table', () => {
+    const sql = 'ALTER TABLE IF EXISTS users ALTER COLUMN email TYPE text;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    assert.ok(res.findings[0].message.includes('"email"'));
+  });
+
+  it('detects multiple ALTER COLUMN TYPE in one statement', () => {
+    const sql = 'ALTER TABLE t ALTER COLUMN a TYPE bigint, ALTER COLUMN b TYPE text;';
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 2);
+  });
+
+  it('passes varchar(X) -> varchar(Y) where Y >= X as WARNING (not BLOCKER) with prior schema', () => {
+    const sql = `
+      CREATE TABLE users (id serial primary key, name varchar(50));
+      ALTER TABLE users ALTER COLUMN name TYPE varchar(100);
+    `;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 0);
+    assert.strictEqual(res.warningsCount, 1);
+    assert.strictEqual(res.findings[0].severity, 'WARNING');
+    assert.ok(res.findings[0].message.includes('metadata-only'));
+  });
+
+  it('flags varchar(X) -> varchar(Y) where Y < X (shrinking) as BLOCKER', () => {
+    const sql = `
+      CREATE TABLE users (id serial primary key, name varchar(100));
+      ALTER TABLE users ALTER COLUMN name TYPE varchar(50);
+    `;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    assert.strictEqual(res.findings[0].severity, 'BLOCKER');
+  });
+
+  it('passes varchar(X) -> text as WARNING (not BLOCKER) with prior schema', () => {
+    const sql = `
+      CREATE TABLE users (id serial primary key, bio varchar(255));
+      ALTER TABLE users ALTER COLUMN bio TYPE text;
+    `;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 0);
+    assert.strictEqual(res.warningsCount, 1);
+  });
+
+  it('passes varchar(X) -> varchar(Y) with comment hint as WARNING (not BLOCKER)', () => {
+    const sql = `
+      -- was: varchar(50)
+      ALTER TABLE users ALTER COLUMN name TYPE varchar(100);
+    `;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 0);
+    assert.strictEqual(res.warningsCount, 1);
+    assert.strictEqual(res.findings[0].severity, 'WARNING');
+  });
+
+  it('flags varchar(X) to integer as BLOCKER even with prior schema', () => {
+    const sql = `
+      CREATE TABLE users (id serial primary key, code varchar(50));
+      ALTER TABLE users ALTER COLUMN code TYPE integer;
+    `;
+    const res = analyzeSql(sql, { rules: [alterColumnTypeRewriteRule] });
+    assert.strictEqual(res.blockersCount, 1);
+    assert.strictEqual(res.findings[0].severity, 'BLOCKER');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule 12: unindexedForeignKey (unindexed-foreign-key)
+// ---------------------------------------------------------------------------
+
+describe('Rule 12: unindexedForeignKey (unindexed-foreign-key)', () => {
+  it('detects ADD CONSTRAINT FOREIGN KEY as WARNING', () => {
+    const sql = 'ALTER TABLE orders ADD CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id);';
+    const res = analyzeSql(sql, { rules: [unindexedForeignKeyRule] });
+    assert.strictEqual(res.warningsCount, 1);
+    const f = res.findings[0];
+    assert.strictEqual(f.ruleId, 'unindexed-foreign-key');
+    assert.strictEqual(f.severity, 'WARNING');
+    assert.ok(f.message.includes('"orders"'));
+    assert.ok(f.suggestion.includes('CREATE INDEX CONCURRENTLY'));
+    assert.ok(f.suggestion.includes('NOT VALID'));
+  });
+
+  it('still warns when NOT VALID is present (index still may be missing)', () => {
+    const sql = 'ALTER TABLE orders ADD CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id) NOT VALID;';
+    const res = analyzeSql(sql, { rules: [unindexedForeignKeyRule] });
+    assert.strictEqual(res.warningsCount, 1);
+    assert.strictEqual(res.findings[0].ruleId, 'unindexed-foreign-key');
+  });
+
+  it('passes when ignored with directive comment', () => {
+    const sql = `-- ddlforge-ignore unindexed-foreign-key\nALTER TABLE orders ADD CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id);`;
+    const res = analyzeSql(sql, { rules: [unindexedForeignKeyRule] });
+    assert.strictEqual(res.findings.length, 0);
+  });
+
+  it('detects multiple FOREIGN KEY clauses in one statement', () => {
+    const sql = `ALTER TABLE shipments
+      ADD CONSTRAINT fk_order FOREIGN KEY (order_id) REFERENCES orders(id),
+      ADD CONSTRAINT fk_carrier FOREIGN KEY (carrier_id) REFERENCES carriers(id);`;
+    const res = analyzeSql(sql, { rules: [unindexedForeignKeyRule] });
+    assert.strictEqual(res.warningsCount, 2);
+  });
+
+  it('includes referencing columns in suggestion', () => {
+    const sql = 'ALTER TABLE orders ADD CONSTRAINT fk_cust FOREIGN KEY (customer_id) REFERENCES customers(id);';
+    const res = analyzeSql(sql, { rules: [unindexedForeignKeyRule] });
+    assert.ok(res.findings[0].suggestion.includes('customer_id'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rule 13: dropColumnLock (drop-column-lock)
+// ---------------------------------------------------------------------------
+
+describe('Rule 13: dropColumnLock (drop-column-lock)', () => {
+  it('detects DROP COLUMN as WARNING with ACCESS EXCLUSIVE lock', () => {
+    const sql = 'ALTER TABLE users DROP COLUMN email;';
+    const res = analyzeSql(sql, { rules: [dropColumnLockRule] });
+    assert.strictEqual(res.warningsCount, 1);
+    const f = res.findings[0];
+    assert.strictEqual(f.ruleId, 'drop-column-lock');
+    assert.strictEqual(f.severity, 'WARNING');
+    assert.ok(f.message.includes('"email"'));
+    assert.ok(f.message.includes('"users"'));
+    assert.ok(f.suggestion.includes('RENAME COLUMN'));
+  });
+
+  it('detects DROP COLUMN IF EXISTS as WARNING', () => {
+    const sql = 'ALTER TABLE users DROP COLUMN IF EXISTS email;';
+    const res = analyzeSql(sql, { rules: [dropColumnLockRule] });
+    assert.strictEqual(res.warningsCount, 1);
+    assert.ok(res.findings[0].message.includes('"email"'));
+  });
+
+  it('passes ALTER TABLE ... ADD COLUMN (no DROP COLUMN)', () => {
+    const sql = 'ALTER TABLE users ADD COLUMN foo text;';
+    const res = analyzeSql(sql, { rules: [dropColumnLockRule] });
+    assert.strictEqual(res.findings.length, 0);
+  });
+
+  it('detects multiple DROP COLUMNs in one statement as 2 findings', () => {
+    const sql = 'ALTER TABLE t DROP COLUMN a, DROP COLUMN b;';
+    const res = analyzeSql(sql, { rules: [dropColumnLockRule] });
+    assert.strictEqual(res.warningsCount, 2);
+    assert.ok(res.findings[0].message.includes('"a"'));
+    assert.ok(res.findings[1].message.includes('"b"'));
+  });
+
+  it('passes when ignored with directive comment', () => {
+    const sql = `-- ddlforge-ignore drop-column-lock\nALTER TABLE users DROP COLUMN email;`;
+    const res = analyzeSql(sql, { rules: [dropColumnLockRule] });
+    assert.strictEqual(res.findings.length, 0);
+  });
 });

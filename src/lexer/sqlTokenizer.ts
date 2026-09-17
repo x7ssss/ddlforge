@@ -272,19 +272,34 @@ export class SqlTokenizer {
   }
 
   private isDollarQuoteStart(): boolean {
-    // Check if current position matches $[A-Za-z0-9_]*$
+    // PostgreSQL dollar-quote tag grammar: $[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_\u0080-\uFFFF]*$
+    // or just $$ (empty tag). Tags CANNOT start with a digit.
+    // See: https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-DOLLAR-QUOTING
     let idx = this.pos + 1;
+
+    // Empty tag: $$ — the very next char is the closing $
+    if (idx < this.length && this.input[idx] === '$') {
+      return true;
+    }
+
+    // Non-empty tag: first char must be a letter or underscore (not digit, not $)
+    if (idx >= this.length || !this.isIdentifierStart(this.input[idx])) {
+      return false;
+    }
+    idx++;
+
+    // Subsequent tag chars: letters, digits, underscores (no embedded $)
     while (idx < this.length) {
       const c = this.input[idx];
       if (c === '$') {
-        return true;
+        return true; // found the closing $
       }
-      if (!this.isIdentifierPart(c)) {
-        return false;
+      if (!this.isIdentifierStart(c) && !this.isDigit(c)) {
+        return false; // invalid tag char
       }
       idx++;
     }
-    return false;
+    return false; // reached EOF without finding closing $
   }
 
   private readDollarString(): Token {

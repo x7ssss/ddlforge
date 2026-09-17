@@ -17,6 +17,7 @@ export interface CliOptions {
   targets: string[];
   pgVersion: number;
   format: 'terminal' | 'json' | 'markdown' | 'sarif';
+  output?: string;
   quiet: boolean;
   changedOnly: boolean;
   help: boolean;
@@ -36,13 +37,14 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.4.0';
+export const VERSION = '0.5.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
     targets: [],
     pgVersion: 16,
     format: 'terminal',
+    output: undefined,
     quiet: false,
     changedOnly: false,
     help: false,
@@ -91,11 +93,27 @@ export function parseArgs(args: string[]): CliOptions {
       continue;
     }
 
+    if (arg === '--output' || arg === '-o') {
+      i++;
+      if (i < args.length) {
+        options.output = args[i];
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--output=')) {
+      options.output = arg.slice('--output='.length);
+      i++;
+      continue;
+    }
+
     if (arg === '--format') {
       i++;
       if (i < args.length) {
         const fmt = args[i].toLowerCase();
-        if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
+        if (fmt === 'pretty') {
+          options.format = 'terminal';
+        } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
           options.format = fmt;
         }
       }
@@ -104,7 +122,9 @@ export function parseArgs(args: string[]): CliOptions {
     }
     if (arg.startsWith('--format=')) {
       const fmt = arg.slice(9).toLowerCase();
-      if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
+      if (fmt === 'pretty') {
+        options.format = 'terminal';
+      } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
         options.format = fmt;
       }
       i++;
@@ -424,6 +444,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return runWrap(argv.slice(1));
   }
 
+  // Explicit check subcommand (e.g. ddlforge check ...)
+  if (argv[0] === 'check') {
+    argv = argv.slice(1);
+  }
+
   const options = parseArgs(argv);
 
   if (options.help) {
@@ -439,14 +464,23 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   const files = discoverSqlFiles(options.targets, options.changedOnly);
 
   if (files.length === 0) {
+    let emptyOutput = '';
     if (options.format === 'json') {
-      console.log(formatJson([]));
+      emptyOutput = formatJson([]);
     } else if (options.format === 'markdown') {
-      console.log(formatMarkdown([]));
+      emptyOutput = formatMarkdown([]);
     } else if (options.format === 'sarif') {
-      console.log(formatSarif([]));
+      emptyOutput = formatSarif([]);
     } else {
-      console.log('No migration .sql files found to analyze.');
+      emptyOutput = 'No migration .sql files found to analyze.';
+    }
+
+    if (options.output) {
+      const outPath = path.isAbsolute(options.output) ? options.output : path.resolve(process.cwd(), options.output);
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, emptyOutput, 'utf-8');
+    } else {
+      console.log(emptyOutput);
     }
     return 0;
   }
@@ -467,15 +501,24 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     }
   }
 
-  // Format and output results
+  // Format results
+  let formattedOutput = '';
   if (options.format === 'json') {
-    console.log(formatJson(results));
+    formattedOutput = formatJson(results);
   } else if (options.format === 'markdown') {
-    console.log(formatMarkdown(results));
+    formattedOutput = formatMarkdown(results);
   } else if (options.format === 'sarif') {
-    console.log(formatSarif(results));
+    formattedOutput = formatSarif(results);
   } else {
-    console.log(formatTerminal(results, { quiet: options.quiet }));
+    formattedOutput = formatTerminal(results, { quiet: options.quiet });
+  }
+
+  if (options.output) {
+    const outPath = path.isAbsolute(options.output) ? options.output : path.resolve(process.cwd(), options.output);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, formattedOutput, 'utf-8');
+  } else {
+    console.log(formattedOutput);
   }
 
   const hasBlockers = results.some(r => r.hasBlockers);

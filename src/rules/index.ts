@@ -13,6 +13,9 @@ export { unbatchedBackfillRule } from './unbatchedBackfill.js';
 export { checkConstraintNotValidRule } from './checkConstraintNotValid.js';
 export { uniqueConstraintUsingIndexRule } from './uniqueConstraintUsingIndex.js';
 export { sessionAdvisoryLockRule } from './sessionAdvisoryLock.js';
+export { alterColumnTypeRewriteRule } from './alterColumnTypeRewrite.js';
+export { unindexedForeignKeyRule } from './unindexedForeignKey.js';
+export { dropColumnLockRule } from './dropColumnLock.js';
 
 import { Rule } from './types.js';
 import { indexConcurrentlyRule } from './indexConcurrently.js';
@@ -25,6 +28,9 @@ import { unbatchedBackfillRule } from './unbatchedBackfill.js';
 import { checkConstraintNotValidRule } from './checkConstraintNotValid.js';
 import { uniqueConstraintUsingIndexRule } from './uniqueConstraintUsingIndex.js';
 import { sessionAdvisoryLockRule } from './sessionAdvisoryLock.js';
+import { alterColumnTypeRewriteRule } from './alterColumnTypeRewrite.js';
+import { unindexedForeignKeyRule } from './unindexedForeignKey.js';
+import { dropColumnLockRule } from './dropColumnLock.js';
 
 export const ALL_RULES: Rule[] = [
   indexConcurrentlyRule,
@@ -37,4 +43,7 @@ export const ALL_RULES: Rule[] = [
   checkConstraintNotValidRule,
   uniqueConstraintUsingIndexRule,
   sessionAdvisoryLockRule,
+  alterColumnTypeRewriteRule,
+  unindexedForeignKeyRule,
+  dropColumnLockRule,
 ];

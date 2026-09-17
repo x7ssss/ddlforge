@@ -334,7 +334,11 @@ export async function executeMigration(
             retryBackoffMs:   backoff.sleepMs,
           });
 
-          await sleep(backoff.sleepMs, signal);
+          try {
+            await sleep(backoff.sleepMs, signal);
+          } catch {
+            // AbortSignal fired during sleep — the guard below will break the loop
+          }
           if (signal?.aborted) break;
         }
 

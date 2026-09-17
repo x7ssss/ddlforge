@@ -473,3 +473,72 @@ describe('parseApplyArgs()', () => {
     assert.strictEqual(opts.monitorPollMs, 500);
   });
 });
+
+/* ──────────────────────────────────────────────────────────────────── */
+/* spawnCommand — exit-code propagation                                */
+/* ──────────────────────────────────────────────────────────────────── */
+
+import { spawnCommand } from '../src/wrapper/orchestrator.js';
+
+describe('spawnCommand signal propagation', () => {
+  const cwd = process.cwd();
+
+  it('resolves with 42 when child calls process.exit(42)', async () => {
+    const code = await spawnCommand(['node', '-e', 'process.exit(42)'], cwd);
+    assert.strictEqual(code, 42);
+  });
+
+  it('resolves with 0 when child calls process.exit(0)', async () => {
+    const code = await spawnCommand(['node', '-e', 'process.exit(0)'], cwd);
+    assert.strictEqual(code, 0);
+  });
+
+  it('resolves with 1 when child calls process.exit(1)', async () => {
+    const code = await spawnCommand(['node', '-e', 'process.exit(1)'], cwd);
+    assert.strictEqual(code, 1);
+  });
+
+  it('resolves with 0 for an empty command array', async () => {
+    const code = await spawnCommand([], cwd);
+    assert.strictEqual(code, 0);
+  });
+
+  it('resolves with a non-zero code for an invalid node flag', async () => {
+    const code = await spawnCommand(['node', '--nonexistent-flag-xyzzy'], cwd);
+    assert.ok(code !== 0, `Expected non-zero exit code, got ${code}`);
+  });
+});
+
+/* ──────────────────────────────────────────────────────────────────── */
+/* computeBackoff — full-jitter correctness                            */
+/* ──────────────────────────────────────────────────────────────────── */
+
+describe('computeBackoff full-jitter properties', () => {
+  it('sleepMs is always >= 0', () => {
+    for (let attempt = 0; attempt <= 20; attempt++) {
+      const { sleepMs } = computeBackoff(attempt, { baseDelayMs: 250, maxDelayMs: 10_000 });
+      assert.ok(sleepMs >= 0, `sleepMs was negative (${sleepMs}) at attempt ${attempt}`);
+    }
+  });
+
+  it('sleepMs never exceeds min(maxDelayMs, baseDelayMs * 2^attempt)', () => {
+    const baseDelayMs = 250;
+    const maxDelayMs  = 5_000;
+    for (let attempt = 0; attempt <= 10; attempt++) {
+      const ceiling = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, attempt));
+      const { sleepMs } = computeBackoff(attempt, { baseDelayMs, maxDelayMs });
+      assert.ok(
+        sleepMs <= ceiling,
+        `sleepMs (${sleepMs}) exceeded ceiling (${ceiling}) at attempt ${attempt}`,
+      );
+    }
+  });
+
+  it('exceeded flag is false below maxRetries and true at/above maxRetries', () => {
+    const opts: BackoffOptions = { maxRetries: 4 };
+    assert.strictEqual(computeBackoff(3, opts).exceeded, false);
+    assert.strictEqual(computeBackoff(4, opts).exceeded, true);
+    assert.strictEqual(computeBackoff(5, opts).exceeded, true);
+  });
+});
+
