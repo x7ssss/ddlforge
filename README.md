@@ -9,6 +9,7 @@
 [![Tests](https://img.shields.io/badge/Tests-132%20passing-brightgreen.svg)](test)
 [![Zero Dependencies](https://img.shields.io/badge/Check%20Deps-0-success.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/x7sss)
 
 ---
 
