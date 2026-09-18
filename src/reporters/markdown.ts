@@ -72,6 +72,13 @@ export function formatMarkdown(results: AnalysisResult[]): string {
       lines.push(finding.suggestion);
       lines.push('```');
       lines.push('');
+      if (finding.remediation) {
+        lines.push('**Zero-Downtime Remediation Recipe:**');
+        lines.push('```sql');
+        lines.push(finding.remediation);
+        lines.push('```');
+        lines.push('');
+      }
       lines.push('</details>');
       lines.push('');
     }

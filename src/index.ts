@@ -22,3 +22,6 @@ export { parseArgs, discoverSqlFiles, runCli, CliOptions } from './cli.js';
 
 // Wrapper
 export * from './wrapper/orchestrator.js';
+
+// Remediations
+export * from './remediations/index.js';

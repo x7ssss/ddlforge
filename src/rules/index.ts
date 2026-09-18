@@ -17,6 +17,14 @@ export { alterColumnTypeRewriteRule } from './alterColumnTypeRewrite.js';
 export { unindexedForeignKeyRule } from './unindexedForeignKey.js';
 export { dropColumnLockRule } from './dropColumnLock.js';
 
+// Postgres 15-17 Concurrency Rules
+export { addPrimaryKeyMissingUsingIndexRule } from './addPrimaryKeyMissingUsingIndex.js';
+export { checkConstraintMissingNotValidRule } from './checkConstraintMissingNotValid.js';
+export { detachPartitionNonConcurrentRule } from './detachPartitionNonConcurrent.js';
+export { reindexMissingConcurrentlyRule } from './reindexMissingConcurrently.js';
+export { enumAddValueInTransactionRule } from './enumAddValueInTransaction.js';
+export { maintenanceCommandDetectedRule } from './maintenanceCommandDetected.js';
+
 import { Rule } from './types.js';
 import { indexConcurrentlyRule } from './indexConcurrently.js';
 import { transactionTrapRule } from './transactionTrap.js';
@@ -32,6 +40,13 @@ import { alterColumnTypeRewriteRule } from './alterColumnTypeRewrite.js';
 import { unindexedForeignKeyRule } from './unindexedForeignKey.js';
 import { dropColumnLockRule } from './dropColumnLock.js';
 
+import { addPrimaryKeyMissingUsingIndexRule } from './addPrimaryKeyMissingUsingIndex.js';
+import { checkConstraintMissingNotValidRule } from './checkConstraintMissingNotValid.js';
+import { detachPartitionNonConcurrentRule } from './detachPartitionNonConcurrent.js';
+import { reindexMissingConcurrentlyRule } from './reindexMissingConcurrently.js';
+import { enumAddValueInTransactionRule } from './enumAddValueInTransaction.js';
+import { maintenanceCommandDetectedRule } from './maintenanceCommandDetected.js';
+
 export const ALL_RULES: Rule[] = [
   indexConcurrentlyRule,
   transactionTrapRule,
@@ -46,4 +61,12 @@ export const ALL_RULES: Rule[] = [
   alterColumnTypeRewriteRule,
   unindexedForeignKeyRule,
   dropColumnLockRule,
+
+  // 6 New Concurrency Rules
+  addPrimaryKeyMissingUsingIndexRule,
+  checkConstraintMissingNotValidRule,
+  detachPartitionNonConcurrentRule,
+  reindexMissingConcurrentlyRule,
+  enumAddValueInTransactionRule,
+  maintenanceCommandDetectedRule,
 ];

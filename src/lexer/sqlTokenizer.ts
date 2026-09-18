@@ -17,6 +17,9 @@ export class SqlTokenizer {
   private column: number = 1;
 
   constructor(input: string) {
+    if (input.charCodeAt(0) === 0xFEFF) {
+      input = input.slice(1);
+    }
     this.input = input;
     this.length = input.length;
   }
@@ -486,6 +489,9 @@ export class SqlTokenizer {
  * source coordinates, and inline lint directives.
  */
 export function splitStatements(sql: string): Statement[] {
+  if (sql.charCodeAt(0) === 0xFEFF) {
+    sql = sql.slice(1);
+  }
   const tokenizer = new SqlTokenizer(sql);
   const allTokens = tokenizer.tokenize({ includeWhitespace: false, includeComments: true });
 

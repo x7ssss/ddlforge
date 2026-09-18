@@ -19,6 +19,7 @@ export interface Finding {
   line: number;
   column: number;
   codeSnippet: string;
+  remediation?: string;
 }
 
 export interface RuleContext {
@@ -28,6 +29,7 @@ export interface RuleContext {
   statements: Statement[];
   isPrismaMigration: boolean;
   hasFilePrismaNoTransaction: boolean;
+  activeRuleIds?: Set<string>;
 }
 
 export interface Rule {

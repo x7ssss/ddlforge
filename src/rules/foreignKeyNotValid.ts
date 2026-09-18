@@ -8,6 +8,7 @@
 import { Rule, RuleContext, Finding } from './types.js';
 import { PostgresLockLevel } from '../engine/locks.js';
 import { Token } from '../lexer/tokens.js';
+import { buildUnvalidatedForeignKeyRemediation } from '../remediations/templates.js';
 
 interface ForeignKeyClause {
   constraintName?: string;
@@ -113,6 +114,29 @@ export const foreignKeyNotValidRule: Rule = {
 
       for (const fk of fkClauses) {
         if (!fk.hasNotValid) {
+          let col = 'column';
+          let fTable = 'foreign_table';
+          let fCol = 'id';
+          for (let s = 0; s < fk.tokens.length; s++) {
+            if (fk.tokens[s]?.value === 'KEY' && fk.tokens[s + 1]?.value === '(') {
+              col = fk.tokens[s + 2]?.raw ?? col;
+            }
+            if (fk.tokens[s]?.value === 'REFERENCES') {
+              fTable = fk.tokens[s + 1]?.raw ?? fTable;
+              if (fk.tokens[s + 2]?.value === '(') {
+                fCol = fk.tokens[s + 3]?.raw ?? fCol;
+              }
+            }
+          }
+
+          const recipe = buildUnvalidatedForeignKeyRemediation({
+            table: tableName,
+            constraintName: fk.constraintName,
+            column: col,
+            foreignTable: fTable,
+            foreignColumn: fCol,
+          });
+
           const cName = fk.constraintName ? ` "${fk.constraintName}"` : '';
           const validateSuggestion = fk.constraintName
             ? `ALTER TABLE ${tableName} VALIDATE CONSTRAINT ${fk.constraintName};`
@@ -136,6 +160,7 @@ export const foreignKeyNotValidRule: Rule = {
             line: stmt.startLine,
             column: stmt.startColumn,
             codeSnippet: stmt.raw,
+            remediation: recipe.fullSql,
           });
         }
       }

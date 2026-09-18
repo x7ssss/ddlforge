@@ -34,6 +34,9 @@ export class MigrationAnalyzer {
   }
 
   public analyze(sql: string, options: AnalyzerOptions = {}): AnalysisResult {
+    if (sql.charCodeAt(0) === 0xFEFF) {
+      sql = sql.slice(1);
+    }
     const startTime = performance.now();
     const filePath = options.filePath ?? 'anonymous.sql';
     const pgVersion = options.pgVersion ?? 16;
@@ -52,6 +55,7 @@ export class MigrationAnalyzer {
       statements,
       isPrismaMigration: isPrisma,
       hasFilePrismaNoTransaction,
+      activeRuleIds: new Set(this.rules.map(r => r.id)),
     };
 
     const findings: Finding[] = [];

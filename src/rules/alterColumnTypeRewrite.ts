@@ -12,6 +12,7 @@
 import { Rule, RuleContext, Finding } from './types.js';
 import { PostgresLockLevel } from '../engine/locks.js';
 import { Statement, Token } from '../lexer/tokens.js';
+import { buildColumnTypeRewriteRemediation } from '../remediations/templates.js';
 
 interface AlterColumnTypeClause {
   colName: string;
@@ -370,6 +371,12 @@ export const alterColumnTypeRewriteRule: Rule = {
             codeSnippet: stmt.raw,
           });
         } else {
+          const recipe = buildColumnTypeRewriteRemediation({
+            table: tableName,
+            column: clause.colName,
+            newType: clause.newType || 'text',
+          });
+
           findings.push({
             ruleId: this.id,
             ruleName: this.name,
@@ -394,6 +401,7 @@ export const alterColumnTypeRewriteRule: Rule = {
             line: stmt.startLine,
             column: stmt.startColumn,
             codeSnippet: stmt.raw,
+            remediation: recipe.fullSql,
           });
         }
       }

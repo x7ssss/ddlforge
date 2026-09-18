@@ -627,3 +627,24 @@ describe('Comment attachment', () => {
     assert.ok(stmts[1].comments.some((c) => c.includes('between')));
   });
 });
+
+// ---------------------------------------------------------------------------
+// 14. UTF-8 Byte Order Mark (BOM) handling
+// ---------------------------------------------------------------------------
+
+describe('UTF-8 Byte Order Mark (BOM) handling', () => {
+  it('14.1 Strips UTF-8 BOM at index 0 and tokenizes first keyword cleanly', () => {
+    const sql = '\uFEFFALTER TABLE orders ADD PRIMARY KEY (id);';
+    const tokens = nonEofTokens(sql);
+    assert.strictEqual(tokens[0].value, 'ALTER');
+    assert.strictEqual(tokens[0].raw, 'ALTER');
+    assert.strictEqual(tokens[0].type, TokenType.KEYWORD);
+  });
+
+  it('14.2 splitStatements handles UTF-8 BOM without skipping or corrupting statement', () => {
+    const sql = '\uFEFFALTER TABLE orders ADD PRIMARY KEY (id);';
+    const stmts = splitStatements(sql);
+    assert.strictEqual(stmts.length, 1);
+    assert.strictEqual(stmts[0].tokens[0].value, 'ALTER');
+  });
+});

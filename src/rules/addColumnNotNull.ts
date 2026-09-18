@@ -8,6 +8,7 @@
 import { Rule, RuleContext, Finding } from './types.js';
 import { PostgresLockLevel } from '../engine/locks.js';
 import { Token } from '../lexer/tokens.js';
+import { buildNotNullColumnRemediation } from '../remediations/templates.js';
 
 interface AddColumnClause {
   columnName: string;
@@ -135,6 +136,16 @@ export const addColumnNotNullRule: Rule = {
 
       for (const clause of clauses) {
         if (clause.hasNotNull && !clause.hasDefault && !clause.hasGenerated) {
+          const typeTokens = clause.tokens.filter(
+            t => t.value !== 'NOT' && t.value !== 'NULL' && t.value !== 'DEFAULT' && t.value !== 'GENERATED'
+          );
+          const colType = typeTokens.map(t => t.raw).join(' ') || 'TEXT';
+          const recipe = buildNotNullColumnRemediation({
+            table: tableName,
+            column: clause.columnName,
+            type: colType,
+          });
+
           findings.push({
             ruleId: this.id,
             ruleName: this.name,
@@ -151,6 +162,7 @@ export const addColumnNotNullRule: Rule = {
             line: stmt.startLine,
             column: stmt.startColumn,
             codeSnippet: stmt.raw,
+            remediation: recipe.fullSql,
           });
         }
       }

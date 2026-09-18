@@ -92,6 +92,14 @@ export function formatTerminal(results: AnalysisResult[], options: TerminalRepor
         }
       }
 
+      if (finding.remediation) {
+        lines.push(`   ${c.cyan}${c.bold}Zero-Downtime Remediation Recipe:${c.reset}`);
+        const remLines = finding.remediation.split('\n');
+        for (const rLine of remLines) {
+          lines.push(`      ${c.cyan}${rLine}${c.reset}`);
+        }
+      }
+
       lines.push('');
     }
   }

@@ -1,6 +1,7 @@
 /**
  * ddlforge Rule: ADD CONSTRAINT CHECK without NOT VALID
  *
+ * Rule ID: check-constraint-missing-not-valid
  * Severity: BLOCKER
  * Lock: ACCESS EXCLUSIVE
  */
@@ -44,7 +45,6 @@ function extractCheckConstraintClauses(tokens: Token[]): CheckConstraintClause[]
 
       // Check if this clause is a CHECK constraint
       if (tokens[currentIdx]?.value === 'CHECK') {
-        // Collect all tokens for this constraint until top-level comma or end
         const clauseTokens: Token[] = [];
         let hasNotValid = false;
         let subParen = 0;
@@ -84,32 +84,37 @@ function extractCheckConstraintClauses(tokens: Token[]): CheckConstraintClause[]
   return clauses;
 }
 
-export const checkConstraintNotValidRule: Rule = {
-  id: 'check-constraint-not-valid',
+export const checkConstraintMissingNotValidRule: Rule = {
+  id: 'check-constraint-missing-not-valid',
   name: 'ADD CONSTRAINT CHECK without NOT VALID',
-  description: 'Adding a CHECK constraint without NOT VALID performs an immediate full-table scan under ACCESS EXCLUSIVE lock, blocking ALL reads and writes for the duration of the scan.',
+  description:
+    'Adding a CHECK constraint without NOT VALID performs an immediate full-table scan under ACCESS EXCLUSIVE lock, blocking ALL reads and writes for the duration of the scan.',
   defaultSeverity: 'BLOCKER',
   lockLevel: PostgresLockLevel.ACCESS_EXCLUSIVE,
 
   check(context: RuleContext): Finding[] {
-    if (context.activeRuleIds?.has('check-constraint-missing-not-valid')) {
-      return [];
-    }
-
     const findings: Finding[] = [];
 
     for (const stmt of context.statements) {
-      if (stmt.hasIgnore(this.id) || stmt.hasIgnore('check-constraint-missing-not-valid')) continue;
+      if (stmt.hasIgnore(this.id) || stmt.hasIgnore('check-constraint-not-valid')) continue;
 
       const tokens = stmt.tokens;
-      if (tokens.length < 6) continue;
+      if (tokens.length < 5) continue;
 
       if (tokens[0].value !== 'ALTER' || tokens[1].value !== 'TABLE') continue;
 
-      // Extract table name
       let idx = 2;
-      if (tokens[idx]?.value === 'ONLY') idx++;
-      if (tokens[idx]?.value === 'IF' && tokens[idx + 1]?.value === 'EXISTS') idx += 2;
+      while (idx < tokens.length) {
+        if (tokens[idx]?.value === 'IF' && tokens[idx + 1]?.value === 'EXISTS') {
+          idx += 2;
+          continue;
+        }
+        if (tokens[idx]?.value === 'ONLY') {
+          idx++;
+          continue;
+        }
+        break;
+      }
       const tableName = tokens[idx]?.raw ?? 'table';
       idx++;
 
@@ -127,7 +132,7 @@ export const checkConstraintNotValidRule: Rule = {
             lockLevel: this.lockLevel,
             message: `CHECK constraint${cNameDisplay} on table "${tableName}" added without NOT VALID.`,
             detail:
-              `Adding a CHECK constraint without NOT VALID performs an immediate full-table scan under ACCESS EXCLUSIVE lock, blocking ALL reads and writes for the duration of the scan.`,
+              'Adding a CHECK constraint without NOT VALID performs an immediate full-table scan under ACCESS EXCLUSIVE lock, blocking ALL reads and writes for the duration of the scan.',
             suggestion:
               `1. Add constraint without scanning existing rows:\n` +
               `   ALTER TABLE ${tableName} ADD CONSTRAINT ${cName} CHECK (...) NOT VALID;\n` +
