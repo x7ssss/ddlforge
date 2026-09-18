@@ -20,6 +20,7 @@ export interface CliOptions {
   output?: string;
   quiet: boolean;
   changedOnly: boolean;
+  fix: boolean;
   help: boolean;
   version: boolean;
 }
@@ -37,7 +38,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.6.0';
+export const VERSION = '0.8.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -47,6 +48,7 @@ export function parseArgs(args: string[]): CliOptions {
     output: undefined,
     quiet: false,
     changedOnly: false,
+    fix: false,
     help: false,
     version: false,
   };
@@ -63,6 +65,12 @@ export function parseArgs(args: string[]): CliOptions {
 
     if (arg === '--version' || arg === '-v') {
       options.version = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--fix') {
+      options.fix = true;
       i++;
       continue;
     }
@@ -150,6 +158,8 @@ USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
   ddlforge apply <file.sql> --db <url>     # apply a migration safely
   ddlforge wrap [options] -- <command...>  # supervise ORM migration deployments
+  ddlforge split <file.sql>                # split mixed migration into tx and autocommit phases
+  ddlforge forge --orm <type> <file.sql>   # generate ledger SQL to mark out-of-band migration completed
 
 ── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
@@ -160,8 +170,24 @@ FLAGS:
   --format <type>     Output format: terminal | json | markdown | sarif (default: terminal)
   --quiet, -q         Suppress advisories/warnings and emit blockers only
   --changed-only      Use git diff to lint only staged or branch-modified migration files
+  --fix               Automatically apply safe remediation recipes in-place for detected blockers
   --version, -v       Print ddlforge version and exit
   --help, -h          Print this help message and exit
+
+── SPLIT (slice migration) ───────────────────────────────────────────
+  ddlforge split <file.sql>
+
+ARGUMENTS:
+  <file.sql>          Mixed migration file to split into phase1_tx and phase2_autocommit
+
+── FORGE (ledger SQL) ────────────────────────────────────────────────
+  ddlforge forge --orm <prisma|drizzle> <file.sql>
+
+ARGUMENTS:
+  <file.sql>          Target migration file to generate ledger record for
+
+FLAGS:
+  --orm <type>        Target ORM: prisma | drizzle (required)
 
 ── APPLY (execute) ───────────────────────────────────────────────────
   ddlforge apply <file.sql> --db <DATABASE_URL> [flags]
@@ -195,13 +221,14 @@ EXAMPLES:
   $ ddlforge ./prisma/migrations
   $ ddlforge ./drizzle --pg 14 --format json
   $ ddlforge --changed-only
-  $ ddlforge ./migrations/001_add_index.sql
+  $ ddlforge ./migrations/001_add_index.sql --fix
+  $ ddlforge split ./migrations/001_mixed.sql
+  $ ddlforge forge --orm prisma ./prisma/migrations/20260918_add_idx/migration.sql
+  $ ddlforge forge --orm drizzle ./drizzle/0001_initial.sql
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb --dry-run
-  $ ddlforge apply ./migrations/001_add_index.sql --db \$DATABASE_URL --lock-timeout 5000 --max-retries 3
   $ ddlforge wrap -- npx prisma migrate deploy
   $ ddlforge wrap --dir=./drizzle -- npx drizzle-kit migrate
-  $ ddlforge wrap --allow-blockers -- npm run migrate
 `);
 }
 
@@ -444,6 +471,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return runWrap(argv.slice(1));
   }
 
+  // Detect split subcommand
+  if (argv[0] === 'split') {
+    return runSplit(argv.slice(1));
+  }
+
+  // Detect forge subcommand
+  if (argv[0] === 'forge') {
+    return runForge(argv.slice(1));
+  }
+
   // Explicit check subcommand (e.g. ddlforge check ...)
   if (argv[0] === 'check') {
     argv = argv.slice(1);
@@ -490,11 +527,27 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
 
   for (const file of files) {
     try {
-      const content = fs.readFileSync(file, 'utf-8');
-      const res = analyzer.analyze(content, {
+      let content = fs.readFileSync(file, 'utf-8');
+      let res = analyzer.analyze(content, {
         filePath: file,
         pgVersion: options.pgVersion,
       });
+
+      if (options.fix && res.hasBlockers) {
+        const { applyFixes } = await import('./orchestrator/fixer.js');
+        const fixResult = applyFixes(content, res.findings);
+        if (fixResult.appliedCount > 0) {
+          content = fixResult.patchedSql;
+          fs.writeFileSync(file, content, 'utf-8');
+          console.log(`[ddlforge fix] Successfully applied ${fixResult.appliedCount} safe remediation(s) to "${file}".`);
+          // Re-analyze patched content
+          res = analyzer.analyze(content, {
+            filePath: file,
+            pgVersion: options.pgVersion,
+          });
+        }
+      }
+
       results.push(res);
     } catch (err: any) {
       console.error(`Error reading ${file}: ${err?.message ?? String(err)}`);
@@ -673,4 +726,135 @@ export async function runApply(argv: string[]): Promise<number> {
     );
     return 1;
   }
+}
+
+/**
+ * Executes the `ddlforge split` subcommand.
+ */
+export async function runSplit(argv: string[]): Promise<number> {
+  let file = '';
+  for (const arg of argv) {
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge split — Split mixed migration file into phase1_tx and phase2_autocommit
+
+USAGE:
+  ddlforge split <file.sql>
+
+ARGUMENTS:
+  <file.sql>    Migration SQL file containing mixed transactional and autocommit operations
+`);
+      return 0;
+    }
+    if (!arg.startsWith('-') && !file) {
+      file = arg;
+    }
+  }
+
+  if (!file) {
+    console.error('ddlforge split: <file.sql> argument is required.');
+    console.error('Usage: ddlforge split <file.sql>');
+    return 1;
+  }
+
+  const fullPath = path.isAbsolute(file) ? file : path.resolve(process.cwd(), file);
+  if (!fs.existsSync(fullPath)) {
+    console.error(`ddlforge split: File not found: "${file}"`);
+    return 1;
+  }
+
+  const { splitMigrationFile } = await import('./orchestrator/slicer.js');
+  const result = splitMigrationFile(fullPath);
+
+  if (!result) {
+    console.warn(`[ddlforge split] Warning: File "${file}" is already clean (no mixed transactional/autocommit statements). No splitting needed.`);
+    return 0;
+  }
+
+  console.log(`[ddlforge split] Successfully split "${file}" into:`);
+  console.log(`  Phase 1 (Transactional): ${result.phase1Path} (${result.result.phase1Transactional.length} statement(s))`);
+  console.log(`  Phase 2 (Autocommit):    ${result.phase2Path} (${result.result.phase2Autocommit.length} statement(s))`);
+  return 0;
+}
+
+/**
+ * Executes the `ddlforge forge` subcommand.
+ */
+export async function runForge(argv: string[]): Promise<number> {
+  let orm: 'prisma' | 'drizzle' | undefined;
+  let file = '';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge forge — Output ready-to-execute SQL to record completed migration in ORM ledger
+
+USAGE:
+  ddlforge forge --orm <prisma|drizzle> <migration-file.sql>
+
+ARGUMENTS:
+  <migration-file.sql>    Target migration file to generate ledger record for
+
+FLAGS:
+  --orm <type>            Target ORM: prisma | drizzle
+`);
+      return 0;
+    }
+
+    if (arg === '--orm') {
+      i++;
+      if (i < argv.length) {
+        orm = argv[i].toLowerCase() as any;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--orm=')) {
+      orm = arg.slice('--orm='.length).toLowerCase() as any;
+      i++;
+      continue;
+    }
+
+    if (!arg.startsWith('-') && !file) {
+      file = arg;
+    }
+    i++;
+  }
+
+  if (!file) {
+    console.error('ddlforge forge: <migration-file.sql> argument is required.');
+    console.error('Usage: ddlforge forge --orm <prisma|drizzle> <migration-file.sql>');
+    return 1;
+  }
+
+  const fullPath = path.isAbsolute(file) ? file : path.resolve(process.cwd(), file);
+  if (!fs.existsSync(fullPath)) {
+    console.error(`ddlforge forge: File not found: "${file}"`);
+    return 1;
+  }
+
+  // Auto-detect ORM if not explicitly specified
+  if (!orm) {
+    const normalized = fullPath.replace(/\\/g, '/').toLowerCase();
+    if (normalized.includes('prisma')) {
+      orm = 'prisma';
+    } else if (normalized.includes('drizzle')) {
+      orm = 'drizzle';
+    } else {
+      console.error('ddlforge forge: --orm <prisma|drizzle> flag is required.');
+      return 1;
+    }
+  }
+
+  if (orm !== 'prisma' && orm !== 'drizzle') {
+    console.error(`ddlforge forge: Unsupported ORM "${orm}". Supported ORMs are: prisma, drizzle.`);
+    return 1;
+  }
+
+  const { forgeLedger } = await import('./orchestrator/ledger.js');
+  const res = forgeLedger(orm, fullPath);
+  console.log(res.sql);
+  return 0;
 }

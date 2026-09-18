@@ -489,20 +489,26 @@ export class SqlTokenizer {
  * source coordinates, and inline lint directives.
  */
 export function splitStatements(sql: string): Statement[] {
-  if (sql.charCodeAt(0) === 0xFEFF) {
-    sql = sql.slice(1);
+  let workingSql = sql;
+  let bomOffset = 0;
+  if (workingSql.charCodeAt(0) === 0xFEFF) {
+    workingSql = workingSql.slice(1);
+    bomOffset = 1;
   }
-  const tokenizer = new SqlTokenizer(sql);
+  const tokenizer = new SqlTokenizer(workingSql);
   const allTokens = tokenizer.tokenize({ includeWhitespace: false, includeComments: true });
 
   const statements: Statement[] = [];
   let currentTokens: Token[] = [];
   let pendingComments: string[] = [];
   let statementComments: string[] = [];
+  let pendingCommentTokens: Token[] = [];
+  let statementCommentTokens: Token[] = [];
 
   for (const token of allTokens) {
     if (token.type === TokenType.COMMENT) {
       pendingComments.push(token.value);
+      pendingCommentTokens.push(token);
       continue;
     }
 
@@ -512,10 +518,36 @@ export function splitStatements(sql: string): Statement[] {
 
     if (token.type === TokenType.PUNCTUATION && token.value === ';') {
       if (currentTokens.length > 0) {
-        statements.push(createStatement(currentTokens, [...statementComments, ...pendingComments]));
+        const firstTok = currentTokens[0];
+        let start = statementCommentTokens.length > 0
+          ? statementCommentTokens[0].offset
+          : firstTok.offset;
+        while (start > 0 && workingSql[start - 1] !== '\n' && workingSql[start - 1] !== '\r' && (workingSql[start - 1] === ' ' || workingSql[start - 1] === '\t')) {
+          start--;
+        }
+
+        let end = token.offset + token.raw.length;
+        let scan = end;
+        while (scan < workingSql.length && workingSql[scan] !== '\n' && workingSql[scan] !== '\r') {
+          if (workingSql[scan] === '-' && workingSql[scan + 1] === '-') {
+            while (scan < workingSql.length && workingSql[scan] !== '\n' && workingSql[scan] !== '\r') scan++;
+            end = scan;
+            break;
+          }
+          scan++;
+        }
+
+        statements.push(createStatement(
+          currentTokens,
+          [...statementComments, ...pendingComments],
+          start + bomOffset,
+          end + bomOffset
+        ));
         currentTokens = [];
         statementComments = [];
+        statementCommentTokens = [];
         pendingComments = [];
+        pendingCommentTokens = [];
       }
       continue;
     }
@@ -523,7 +555,9 @@ export function splitStatements(sql: string): Statement[] {
     // Attach any comments encountered prior to the first token of a statement
     if (currentTokens.length === 0 && pendingComments.length > 0) {
       statementComments = [...pendingComments];
+      statementCommentTokens = [...pendingCommentTokens];
       pendingComments = [];
+      pendingCommentTokens = [];
     }
 
     currentTokens.push(token);
@@ -531,13 +565,43 @@ export function splitStatements(sql: string): Statement[] {
 
   // Handle trailing statement without semicolon
   if (currentTokens.length > 0) {
-    statements.push(createStatement(currentTokens, [...statementComments, ...pendingComments]));
+    const firstTok = currentTokens[0];
+    const lastTok = currentTokens[currentTokens.length - 1];
+    let start = statementCommentTokens.length > 0
+      ? statementCommentTokens[0].offset
+      : firstTok.offset;
+    while (start > 0 && workingSql[start - 1] !== '\n' && workingSql[start - 1] !== '\r' && (workingSql[start - 1] === ' ' || workingSql[start - 1] === '\t')) {
+      start--;
+    }
+
+    let end = lastTok.offset + lastTok.raw.length;
+    let scan = end;
+    while (scan < workingSql.length && workingSql[scan] !== '\n' && workingSql[scan] !== '\r') {
+      if (workingSql[scan] === '-' && workingSql[scan + 1] === '-') {
+        while (scan < workingSql.length && workingSql[scan] !== '\n' && workingSql[scan] !== '\r') scan++;
+        end = scan;
+        break;
+      }
+      scan++;
+    }
+
+    statements.push(createStatement(
+      currentTokens,
+      [...statementComments, ...pendingComments],
+      start + bomOffset,
+      end + bomOffset
+    ));
   }
 
   return statements;
 }
 
-function createStatement(tokens: Token[], comments: string[]): Statement {
+function createStatement(
+  tokens: Token[],
+  comments: string[],
+  startOffset: number = 0,
+  endOffset: number = 0
+): Statement {
   const startLine = tokens[0]?.line ?? 1;
   const startColumn = tokens[0]?.column ?? 1;
   const lastToken = tokens[tokens.length - 1];
@@ -554,6 +618,8 @@ function createStatement(tokens: Token[], comments: string[]): Statement {
     startColumn,
     endLine,
     endColumn,
+    startOffset,
+    endOffset,
     hasIgnore(ruleId?: string): boolean {
       for (const comment of comments) {
         const lower = comment.toLowerCase();

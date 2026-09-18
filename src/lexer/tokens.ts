@@ -32,6 +32,8 @@ export interface Statement {
   startColumn: number;
   endLine: number;
   endColumn: number;
+  startOffset: number;
+  endOffset: number;
   hasIgnore(ruleId?: string): boolean;
 }
 
