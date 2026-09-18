@@ -25,6 +25,13 @@ export { reindexMissingConcurrentlyRule } from './reindexMissingConcurrently.js'
 export { enumAddValueInTransactionRule } from './enumAddValueInTransaction.js';
 export { maintenanceCommandDetectedRule } from './maintenanceCommandDetected.js';
 
+// v0.7.0 Transaction Boundary Safety & Modern ORM Trap Rules
+export { identitySequenceStartWithRule } from './identitySequenceStartWith.js';
+export { attachPartitionMissingCheckRule } from './attachPartitionMissingCheck.js';
+export { enumRecreateTableRewriteRule } from './enumRecreateTableRewrite.js';
+export { nonTransactionalInTransactionRule } from './nonTransactionalInTransaction.js';
+export { lockAccumulationMixedDdlDmlRule } from './lockAccumulationMixedDdlDml.js';
+
 import { Rule } from './types.js';
 import { indexConcurrentlyRule } from './indexConcurrently.js';
 import { transactionTrapRule } from './transactionTrap.js';
@@ -46,6 +53,12 @@ import { detachPartitionNonConcurrentRule } from './detachPartitionNonConcurrent
 import { reindexMissingConcurrentlyRule } from './reindexMissingConcurrently.js';
 import { enumAddValueInTransactionRule } from './enumAddValueInTransaction.js';
 import { maintenanceCommandDetectedRule } from './maintenanceCommandDetected.js';
+
+import { identitySequenceStartWithRule } from './identitySequenceStartWith.js';
+import { attachPartitionMissingCheckRule } from './attachPartitionMissingCheck.js';
+import { enumRecreateTableRewriteRule } from './enumRecreateTableRewrite.js';
+import { nonTransactionalInTransactionRule } from './nonTransactionalInTransaction.js';
+import { lockAccumulationMixedDdlDmlRule } from './lockAccumulationMixedDdlDml.js';
 
 export const ALL_RULES: Rule[] = [
   indexConcurrentlyRule,
@@ -69,4 +82,12 @@ export const ALL_RULES: Rule[] = [
   reindexMissingConcurrentlyRule,
   enumAddValueInTransactionRule,
   maintenanceCommandDetectedRule,
+
+  // v0.7.0 Transaction Boundary Safety & Modern ORM Trap Rules
+  identitySequenceStartWithRule,
+  attachPartitionMissingCheckRule,
+  enumRecreateTableRewriteRule,
+  nonTransactionalInTransactionRule,
+  lockAccumulationMixedDdlDmlRule,
 ];
+

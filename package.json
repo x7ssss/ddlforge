@@ -1,6 +1,6 @@
 {
   "name": "ddlforge",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Ultra-fast, zero-runtime-dependency Postgres migration lock linter and data-loss prevention engine CLI in Node.js 20+ and TypeScript",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -16,7 +16,7 @@
   "scripts": {
     "build": "tsc && node -e \"const fs=require('fs'); try{fs.chmodSync('dist/bin/ddlforge.js', 0o755)}catch{}\"",
     "test:build": "tsc -p tsconfig.test.json",
-    "test": "npm run test:build && node --test dist/test/analyzer.test.js dist/test/runner.test.js dist/test/linter.test.js dist/test/reporter.test.js dist/test/wrapper.test.js dist/test/fuzz-parser.test.js dist/test/remediations.test.js dist/test/rules/concurrencyRules.test.js",
+    "test": "npm run test:build && node --test dist/test/analyzer.test.js dist/test/runner.test.js dist/test/linter.test.js dist/test/reporter.test.js dist/test/wrapper.test.js dist/test/fuzz-parser.test.js dist/test/remediations.test.js dist/test/rules/concurrencyRules.test.js dist/test/rules/v070Rules.test.js",
     "test:watch": "node --test --watch dist/test/analyzer.test.js dist/test/runner.test.js",
     "prepack": "node -e \"const fs=require('fs'); try{fs.rmSync('dist/test', {recursive:true, force:true})}catch{}\"",
     "prepublishOnly": "npm run build && node -e \"const fs=require('fs'); try{fs.rmSync('dist/test', {recursive:true, force:true})}catch{}\""
