@@ -3,10 +3,10 @@
 > **Zero-dependency PostgreSQL DDL migration supervisor & linter for Node.js / TypeScript.**  
 > Eliminates lock queues, connection pool exhaustion, and deploy deadlocks across Prisma, Drizzle, and raw SQL migrations.
 
-[![npm version](https://img.shields.io/badge/npm-v0.5.0-blue.svg)](package.json)
+[![npm version](https://img.shields.io/badge/npm-v0.6.0-blue.svg)](package.json)
 [![Node.js](https://img.shields.io/badge/Node.js-20%2B-green.svg)](https://nodejs.org)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5%2B-blue.svg)](https://www.typescriptlang.org)
-[![Tests](https://img.shields.io/badge/Tests-240%20passing-brightgreen.svg)](test)
+[![Tests](https://img.shields.io/badge/Tests-317%20passing-brightgreen.svg)](test)
 [![Zero Dependencies](https://img.shields.io/badge/Check%20Deps-0-success.svg)](package.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Support on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/x7sss)
@@ -194,6 +194,12 @@ npx ddlforge apply ./migrations/001_add_index.sql \
 | `alter-column-type-rewrite`<br>`(alter-column-type-rewrite)` | `ACCESS EXCLUSIVE` | **BLOCKER** (rewrites)<br>**WARNING** (metadata-only) | `ALTER TABLE ... ALTER COLUMN ... TYPE` causes full physical table rewrite under `ACCESS EXCLUSIVE` lock in most cases. | 1. `ADD COLUMN col_new <new_type>;`<br>2. Backfill in batches.<br>3. In transaction: `RENAME COLUMN col TO col_old; RENAME COLUMN col_new TO col;`<br>4. `DROP COLUMN col_old;` |
 | `unindexed-foreign-key`<br>`(unindexed-foreign-key)` | `NONE` | **WARNING** | Adding `FOREIGN KEY` without covering index on referencing columns causes sequential scan locks during parent updates/deletes. | 1. `CREATE INDEX CONCURRENTLY idx ON t(fk_cols);`<br>2. `ADD CONSTRAINT fk FOREIGN KEY (...) NOT VALID;`<br>3. `VALIDATE CONSTRAINT fk;` |
 | `drop-column-lock`<br>`(drop-column-lock)` | `ACCESS EXCLUSIVE` | **WARNING** | `DROP COLUMN` holds `ACCESS EXCLUSIVE` lock on the table, blocking all concurrent read and write operations. | 1. Deploy app code that stops reading/writing the column first.<br>2. Drop column in low-traffic maintenance window. |
+| `add-primary-key-missing-using-index` | `ACCESS EXCLUSIVE` | **BLOCKER** | `ADD PRIMARY KEY` without `USING INDEX` acquires `ACCESS EXCLUSIVE` lock and builds index synchronously, blocking all queries. | 1. `CREATE UNIQUE INDEX CONCURRENTLY idx ON t(cols);`<br>2. `ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY USING INDEX idx;` |
+| `check-constraint-missing-not-valid` | `ACCESS EXCLUSIVE` | **BLOCKER** | Adding a `CHECK` constraint without `NOT VALID` locks all concurrent reads and writes during table verification. | 1. `ADD CONSTRAINT chk CHECK (...) NOT VALID;`<br>2. `VALIDATE CONSTRAINT chk;` |
+| `detach-partition-non-concurrent` | `ACCESS EXCLUSIVE` | **BLOCKER** | `ALTER TABLE ... DETACH PARTITION` without `CONCURRENTLY` (PG 14+) blocks all read/write traffic across the partitioned table. | Use `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY;` |
+| `reindex-missing-concurrently` | `SHARE` / `ACCESS EXCLUSIVE` | **BLOCKER** | Running `REINDEX` on table, index, or schema without `CONCURRENTLY` locks concurrent writes or reads. | Add `CONCURRENTLY` option: `REINDEX TABLE CONCURRENTLY t;` (run outside transactions). |
+| `enum-add-value-in-transaction` | `NONE` | **BLOCKER** | `ALTER TYPE ... ADD VALUE` cannot run inside transaction blocks or be referenced in the same transaction in PostgreSQL. | Run outside transactions or add `-- prisma:no-transaction` directive. |
+| `maintenance-command-detected` | `ACCESS EXCLUSIVE` | **BLOCKER** | `VACUUM FULL`, `CLUSTER`, or `TRUNCATE` in migration files causes severe global lockouts or instant data loss. | Execute maintenance out-of-band via background jobs, or use non-blocking tools like `pg_repack`. |
 
 ---
 
@@ -277,6 +283,88 @@ ALTER TABLE orders VALIDATE CONSTRAINT fk_user;
 -- 1. Release application code that no longer selects or writes the column.
 -- 2. Once old code is fully drained, drop column in a scheduled maintenance window:
 ALTER TABLE users DROP COLUMN deprecated_field;
+```
+
+### 8. `add-primary-key-missing-using-index`
+```sql
+-- ❌ Dangerous: Builds index synchronously under ACCESS EXCLUSIVE, blocking all queries
+ALTER TABLE orders ADD PRIMARY KEY (id);
+
+-- ✅ Safe: Pre-build unique index concurrently, then attach instantaneously
+CREATE UNIQUE INDEX CONCURRENTLY orders_pkey_idx ON orders (id);
+ALTER TABLE orders ADD CONSTRAINT orders_pkey PRIMARY KEY USING INDEX orders_pkey_idx;
+```
+
+### 9. `detach-partition-non-concurrent`
+```sql
+-- ❌ Dangerous: Non-concurrent partition detach blocks writes across the entire partitioned table
+ALTER TABLE measurement DETACH PARTITION measurement_y2026m01;
+
+-- ✅ Safe: Detach concurrently (supported in PostgreSQL 14+)
+ALTER TABLE measurement DETACH PARTITION measurement_y2026m01 CONCURRENTLY;
+```
+
+### 10. `reindex-missing-concurrently`
+```sql
+-- ❌ Dangerous: Table-wide REINDEX locks all write traffic during re-indexing
+REINDEX TABLE orders;
+
+-- ✅ Safe: Reindex concurrently without blocking concurrent queries (run outside transaction)
+REINDEX TABLE CONCURRENTLY orders;
+```
+
+### 11. `enum-add-value-in-transaction`
+```sql
+-- ❌ Dangerous: ALTER TYPE ... ADD VALUE cannot be executed inside a multi-statement transaction
+BEGIN;
+ALTER TYPE order_status ADD VALUE 'refunded';
+COMMIT;
+
+-- ✅ Safe: Run outside an explicit transaction block or add Prisma directive:
+-- prisma:no-transaction
+ALTER TYPE order_status ADD VALUE 'refunded';
+```
+
+### 12. `maintenance-command-detected`
+```sql
+-- ❌ Dangerous: VACUUM FULL, CLUSTER, or TRUNCATE causes catastrophic lockouts or data loss
+VACUUM FULL orders;
+
+-- ✅ Safe: Run maintenance out-of-band using background maintenance jobs or pg_repack
+```
+
+---
+
+## Zero-Downtime Remediation Engine
+
+`ddlforge` v0.6.0 includes an automated **Zero-Downtime Remediation Engine** that generates multi-phase migration recipes with fail-safe lock guards.
+
+### Remediation Principles
+1. **Isolated Autocommit Phases**: Dangerous non-concurrent operations (`CREATE INDEX CONCURRENTLY`, `REINDEX CONCURRENTLY`) are isolated into autocommit phases outside transaction blocks.
+2. **Lock-Timeout Guards**: Transactional metadata steps automatically inject `SET LOCAL lock_timeout = '2s';` so that transactions fail fast rather than stalling active traffic.
+3. **Resumable Batching**: Large backfill and rewrite operations generate batch loops with `LIMIT 5000` and throttling pauses (`PERFORM pg_sleep(0.1);`) to eliminate WAL bloat and lock queues.
+
+### Generated Recipe Example: Primary Key Addition
+
+When `add-primary-key-missing-using-index` flags an unsafe `ALTER TABLE orders ADD PRIMARY KEY (id);`, `ddlforge` generates:
+
+```sql
+-- ══════════════════════════════════════════════════════════════════════
+-- Zero-Downtime Migration Recipe: Zero-Downtime Primary Key Addition on "orders" (id)
+-- ══════════════════════════════════════════════════════════════════════
+
+-- Phase 1: Create unique index concurrently
+-- Description: Builds the supporting unique index in the background without locking the table against concurrent writes (INSERT, UPDATE, DELETE). Must run outside a transaction.
+-- Execution: Must run OUTSIDE an explicit transaction block (autocommit)
+CREATE UNIQUE INDEX CONCURRENTLY orders_pkey_idx ON orders (id);
+
+-- Phase 2: Attach index as PRIMARY KEY constraint
+-- Description: Attaches the pre-built index to establish the PRIMARY KEY constraint instantaneously via metadata update without rescanning table data.
+-- Execution: Must be run inside a transaction block with lock_timeout
+BEGIN;
+SET LOCAL lock_timeout = '2s';
+ALTER TABLE orders ADD CONSTRAINT pk_orders PRIMARY KEY USING INDEX orders_pkey_idx;
+COMMIT;
 ```
 
 ---
@@ -459,22 +547,15 @@ ddlforge/
 │   └── ddlforge.ts              # Global executable CLI entrypoint
 ├── src/
 │   ├── lexer/
-│   │   ├── sqlTokenizer.ts      # Zero-dependency single-pass SQL lexer
+│   │   ├── sqlTokenizer.ts      # Zero-dependency single-pass SQL lexer (UTF-8 BOM safe)
 │   │   └── tokens.ts            # Token & Statement definitions
 │   ├── engine/
 │   │   ├── analyzer.ts          # Static rule pipeline orchestrator
 │   │   └── locks.ts             # Postgres lock levels & conflict taxonomy
-│   ├── rules/                   # 10 zero-downtime safety rules
-│   │   ├── indexConcurrently.ts
-│   │   ├── transactionTrap.ts
-│   │   ├── addColumnNotNull.ts
-│   │   ├── foreignKeyNotValid.ts
-│   │   ├── checkConstraintNotValid.ts
-│   │   ├── uniqueConstraintUsingIndex.ts
-│   │   ├── prismaRenameDropAdd.ts
-│   │   ├── setNotNullFullScan.ts
-│   │   ├── unbatchedBackfill.ts
-│   │   └── sessionAdvisoryLock.ts
+│   ├── rules/                   # 19 zero-downtime safety rules (PostgreSQL 11-17)
+│   ├── remediations/            # Multi-phase zero-downtime remediation generator
+│   │   ├── types.ts             # Remediation builder types
+│   │   └── templates.ts         # Multi-phase templates & backfill generators
 │   ├── wrapper/                 # wrap — ORM supervisor orchestrator
 │   │   └── orchestrator.ts      # Pre-flight interceptor & child delegation
 │   ├── runner/                  # apply — runtime execution supervisor
@@ -492,7 +573,11 @@ ddlforge/
     ├── linter.test.ts           # v0.3.0 rules & fixture verification tests
     ├── reporter.test.ts         # SARIF 2.1.0 schema & reporter tests
     ├── runner.test.ts           # Backoff, lock monitor, executor tests
-    └── wrapper.test.ts          # ORM layout detection, pre-flight abort tests
+    ├── wrapper.test.ts          # ORM layout detection, pre-flight abort tests
+    ├── fuzz-parser.test.ts      # Adversarial parser & UTF-8 BOM edge cases
+    ├── remediations.test.ts     # Multi-phase template generation tests
+    └── rules/
+        └── concurrencyRules.test.ts # PG 15-17 concurrency rules & CLI check tests
 ```
 
 ---
@@ -504,7 +589,7 @@ npm test
 ```
 
 ```text
-✔ 132 tests passed across 31 suites (0 failures)
+✔ 317 tests passed across 62 suites (0 failures)
 ✔ analyzes 100 migrations in under 15 milliseconds
 ```
 

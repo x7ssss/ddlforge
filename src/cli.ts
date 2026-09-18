@@ -37,7 +37,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.5.0';
+export const VERSION = '0.6.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {

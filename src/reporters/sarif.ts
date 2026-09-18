@@ -11,7 +11,7 @@ import { ALL_RULES } from '../rules/index.js';
 const SARIF_SCHEMA = 'https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json';
 const SARIF_VERSION = '2.1.0';
 const TOOL_NAME = 'ddlforge';
-const TOOL_VERSION = '0.5.0';
+const TOOL_VERSION = '0.6.0';
 const TOOL_INFO_URI = 'https://github.com/ddlforge/ddlforge';
 
 // ── SARIF 2.1.0 type definitions (inline — no external dependency) ─────────
