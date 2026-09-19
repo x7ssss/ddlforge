@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.0.0';
+export const VERSION = '1.1.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -157,6 +157,8 @@ ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock lin
 
 USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
+  ddlforge diff [options]                  # compare live database schema against migration ASTs
+  ddlforge lock <status|release> [options] # inspect or clear distributed advisory locks
   ddlforge apply <file.sql> --db <url>     # apply a migration safely
   ddlforge wrap [options] -- <command...>  # supervise ORM migration deployments
   ddlforge split <file.sql>                # split mixed migration into tx and autocommit phases
@@ -165,6 +167,27 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+
+── DIFF (live schema drift) ──────────────────────────────────────────
+  ddlforge diff [--db <url>] [--dir <path>] [--format <terminal|json>]
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (defaults to DATABASE_URL)
+  --dir <path>        Directory or files containing target migration SQL
+  --schema <name>     Target PostgreSQL schema to introspect (default: public)
+  --format <type>     Output format: terminal | json (default: terminal)
+
+── LOCK (distributed advisory clustering) ────────────────────────────
+  ddlforge lock <status|release> [options]
+
+COMMANDS:
+  status              List active and stale distributed advisory locks
+  release             Release stale advisory locks or clear ddlforge_run state
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (defaults to DATABASE_URL)
+  --project <name>    Filter by project name
+  --force             Force clear all records even if heartbeat is recent
 
 ── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
@@ -538,6 +561,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect test subcommand
   if (argv[0] === 'test') {
     return runTest(argv.slice(1));
+  }
+
+  // Detect lock subcommand
+  if (argv[0] === 'lock') {
+    return runLock(argv.slice(1));
+  }
+
+  // Detect diff subcommand
+  if (argv[0] === 'diff') {
+    return runDiff(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -1216,4 +1249,225 @@ EXAMPLES:
 
   console.log(result.summary);
   return result.passed ? 0 : 1;
+}
+
+/**
+ * Executes the `ddlforge lock` subcommand.
+ */
+export async function runLock(argv: string[]): Promise<number> {
+  const sub = argv[0];
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge lock — Distributed advisory lock clustering inspection and management
+
+USAGE:
+  ddlforge lock <status|release> [options]
+
+COMMANDS:
+  status      Inspect active and stale advisory locks via pg_locks & ddlforge_run
+  release     Release stale advisory locks and clear orphaned runner records
+
+FLAGS:
+  --db <url>        PostgreSQL database connection URL (or DATABASE_URL env var)
+  --project <name>  Filter by project name
+  --force           Force clear runner records even if heartbeat is recent
+  --help, -h        Print this help message
+`);
+    return 0;
+  }
+
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let project = '';
+  let force = false;
+
+  let i = 1;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--db' || arg === '--database-url') {
+      i++;
+      if (i < argv.length) dbUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      dbUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+    if (arg === '--project') {
+      i++;
+      if (i < argv.length) project = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--project=')) {
+      project = arg.slice('--project='.length);
+      i++;
+      continue;
+    }
+    if (arg === '--force') {
+      force = true;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  if (!dbUrl) {
+    console.error('ddlforge lock: --db <url> is required (or set DATABASE_URL env var).');
+    return 1;
+  }
+
+  const { Client } = await import('pg');
+  const client = new Client({ connectionString: dbUrl });
+  await client.connect();
+
+  try {
+    const { DistributedLockManager } = await import('./cluster/advisory.js');
+    const lockMgr = new DistributedLockManager({ project: project || 'default' });
+
+    if (sub === 'status') {
+      const report = await lockMgr.getLockStatus(client, project || undefined);
+      console.log(`\n=== ddlforge Distributed Lock Status ===`);
+      console.log(`Active locks: ${report.activeCount}, Stale locks: ${report.staleCount}\n`);
+      if (report.records.length === 0) {
+        console.log('No active ddlforge advisory locks found.');
+      } else {
+        for (const r of report.records) {
+          const statusBadge = r.isStale ? '[STALE]' : '[ACTIVE]';
+          console.log(`${statusBadge} Namespace: "${r.lockNamespace}" (Key: ${r.lockKey})`);
+          console.log(`   Runner: ${r.runnerId}, PID: ${r.pid}, App: ${r.applicationName ?? 'none'}`);
+          console.log(`   Acquired: ${r.acquiredAt.toISOString()}, Heartbeat: ${r.lastHeartbeat.toISOString()}`);
+          console.log(`   Backend alive: ${r.isBackendAlive ? 'yes' : 'no'}\n`);
+        }
+      }
+      return 0;
+    }
+
+    if (sub === 'release') {
+      const report = await lockMgr.releaseStaleLocks(client, { project: project || undefined, force });
+      console.log(`\n=== ddlforge Distributed Lock Release ===`);
+      console.log(`Cleared records: ${report.clearedCount}, Unlocked sessions: ${report.unlockedCount}`);
+      for (const d of report.details) {
+        console.log(`  ✔ ${d}`);
+      }
+      return 0;
+    }
+
+    console.error(`ddlforge lock: Unknown subcommand "${sub}". Supported subcommands: status, release.`);
+    return 1;
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
+/**
+ * Executes the `ddlforge diff` subcommand.
+ */
+export async function runDiff(argv: string[]): Promise<number> {
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let dir = '';
+  let format: 'terminal' | 'json' = 'terminal';
+  let schema = 'public';
+  const targets: string[] = [];
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge diff — Live schema drift introspection and AST comparison
+
+USAGE:
+  ddlforge diff [options] [<files...>]
+
+FLAGS:
+  --db <url>        PostgreSQL database connection URL (or DATABASE_URL env var)
+  --dir <path>      Directory containing target migration SQL files
+  --schema <name>   PostgreSQL schema to introspect (default: public)
+  --format <type>   Output format: terminal | json (default: terminal)
+  --help, -h        Print this help message
+
+EXAMPLES:
+  $ ddlforge diff --db postgres://localhost/mydb
+  $ ddlforge diff --dir ./prisma/migrations --format json
+  $ ddlforge diff ./migrations/001_init.sql --db postgres://localhost/mydb
+`);
+      return 0;
+    }
+
+    const nextArg = () => { i++; return i < argv.length ? argv[i] : ''; };
+
+    if (arg === '--db' || arg === '--database-url') { dbUrl = nextArg(); i++; continue; }
+    if (arg.startsWith('--db=')) { dbUrl = arg.slice('--db='.length); i++; continue; }
+
+    if (arg === '--dir') { dir = nextArg(); i++; continue; }
+    if (arg.startsWith('--dir=')) { dir = arg.slice('--dir='.length); i++; continue; }
+
+    if (arg === '--schema') { schema = nextArg(); i++; continue; }
+    if (arg.startsWith('--schema=')) { schema = arg.slice('--schema='.length); i++; continue; }
+
+    if (arg === '--format') {
+      const f = nextArg().toLowerCase();
+      if (f === 'json' || f === 'terminal') format = f;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length).toLowerCase();
+      if (f === 'json' || f === 'terminal') format = f;
+      i++;
+      continue;
+    }
+
+    if (!arg.startsWith('-')) {
+      targets.push(arg);
+    }
+
+    i++;
+  }
+
+  if (!dbUrl) {
+    console.error('ddlforge diff: --db <url> is required (or set DATABASE_URL env var).');
+    return 1;
+  }
+
+  // Find target SQL files
+  const searchTargets = targets.length > 0 ? targets : (dir ? [dir] : []);
+  const files = discoverSqlFiles(searchTargets, false);
+
+  if (files.length === 0) {
+    console.error('ddlforge diff: No target migration SQL files found to compare against.');
+    return 1;
+  }
+
+  let concatenatedSql = '';
+  for (const f of files) {
+    concatenatedSql += '\n' + fs.readFileSync(f, 'utf-8');
+  }
+
+  const { Client } = await import('pg');
+  const client = new Client({ connectionString: dbUrl });
+  await client.connect();
+
+  try {
+    const { introspectCatalog } = await import('./diff/catalog.js');
+    const { catalogToSchemaGraph, buildSchemaGraphFromSql, compareSchemas, formatDiffTerminal, formatDiffJson } = await import('./diff/comparator.js');
+
+    const catalog = await introspectCatalog(client, { schemas: [schema] });
+    const liveGraph = catalogToSchemaGraph(catalog);
+    const targetGraph = buildSchemaGraphFromSql(concatenatedSql);
+
+    const diff = compareSchemas(liveGraph, targetGraph);
+
+    if (format === 'json') {
+      console.log(formatDiffJson(diff));
+    } else {
+      console.log(formatDiffTerminal(diff));
+    }
+
+    return diff.hasUnsafe ? 1 : 0;
+  } finally {
+    await client.end().catch(() => {});
+  }
 }

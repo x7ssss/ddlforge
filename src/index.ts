@@ -28,3 +28,9 @@ export * from './remediations/index.js';
 
 // Orchestrator (Slicer, Ledger, Fixer)
 export * from './orchestrator/index.js';
+
+// Cluster (Distributed Advisory Locking)
+export * from './cluster/index.js';
+
+// Diff (Schema Drift Introspection & AST Comparison)
+export * from './diff/index.js';

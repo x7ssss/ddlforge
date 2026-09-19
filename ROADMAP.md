@@ -47,18 +47,28 @@
 
 ---
 
-## v1.1.0 Target: Distributed Coordination & Real-Time Topology
+## ✅ v1.1.0: Distributed Coordination & Real-Time Topology (COMPLETED)
 
 ### 1. Distributed Advisory Lock Clustering (`src/cluster/advisory.ts`)
-- Deterministic 64-bit BigInt key derivation via Node crypto SHA-256 slice (`readBigInt64BE(0)` on `ddlforge\0v1\0namespace`).
+- Deterministic 64-bit BigInt key derivation via Node crypto SHA-256 slice (`readBigInt64BE(0)` on `ddlforge\0v1\0<project>\0<namespace>`).
 - Transaction-scoped locking (`pg_try_advisory_xact_lock`) for PgBouncer/Supavisor transaction pooling safety.
-- Non-blocking polling loops with graceful abort and distributed state table heartbeat (`ddlforge_run`).
+- Session-scoped locking fallback (`pg_try_advisory_lock` / `pg_advisory_unlock`) for multi-transaction and autocommit flows.
+- Non-blocking polling loops with timeout and distributed state table heartbeat (`ddlforge_run`).
+- CLI subcommands: `ddlforge lock status` and `ddlforge lock release`.
 
 ### 2. Live Schema Drift Detection & Reverse-Engineering (`ddlforge diff`)
-- High-speed, non-locking catalog queries against `pg_catalog` (avoiding `information_schema`) run under `REPEATABLE READ READ ONLY` with `lock_timeout = '250ms'`.
-- Decompiles table definitions, generated/identity columns (`pg_get_expr`), indexes (partial predicates, expressions), constraints (`convalidated` state), partitions (`pg_inherits`), and enum ordering (`enumsortorder`).
-- AST structural diffing via `libpg_query` normalized graphs (`SchemaGraph`) discarding location offsets and cosmetic formatting.
+- High-speed, non-locking catalog queries against `pg_catalog` directly (bypassing `information_schema`) run under `REPEATABLE READ READ ONLY` with `lock_timeout = '250ms'` and `statement_timeout = '30s'`.
+- Decompiles tables & columns (`format_type`, `attnotnull`, `attidentity`, `pg_get_expr`), indexes (`pg_get_indexdef`, partial predicates, `indisvalid`), constraints (`convalidated` state), partitions (`pg_inherits` recursive CTE), and enums (`enumsortorder`).
 - Defensive query safety: active lock contention monitor querying `pg_stat_activity` and `pg_blocking_pids()` with self-cancellation (`pg_cancel_backend`) if blocking OLTP transactions.
+- Deterministic AST schema comparator (`src/diff/comparator.ts`) with normalized `SchemaGraph` comparison.
+- Risk classification: `missing`, `extra` (orphaned), `changed`, and `unsafe` (blocking locks, table rewrites, unvalidated constraints).
+- CLI command: `ddlforge diff [--db <url>] [--dir <path>] [--format terminal|json]`.
+
+### 3. Test Suite (524 tests, 0 failures)
+- `test/cluster/advisory.test.ts`: BigInt boundaries, two's complement, lock manager acquisition, heartbeat, status reporting, stale lock cleanup.
+- `test/diff/comparator.test.ts`: AST SchemaGraph parsing, schema drift comparisons, risk classifications, formatting.
+- `test/diff/catalog.test.ts`: Direct pg_catalog snapshotting, transaction isolation, lock contention self-cancellation.
+- `test/diff/cli.test.ts`: CLI help screens and argument validation.
 
 ---
 
