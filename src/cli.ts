@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -157,6 +157,7 @@ ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock lin
 
 USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
+  ddlforge partition <cmd> [options]       # declarative partition lifecycle (convert, attach, detach, maintenance)
   ddlforge run <file.sql> --db <url>       # execute migration with autonomous lock pre-emption
   ddlforge top [options]                   # real-time lock contention & deadlock graph visualizer
   ddlforge diff [options]                  # compare live database schema against migration ASTs
@@ -170,6 +171,51 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+
+── PARTITION (declarative partition lifecycle) ─────────────────────────
+  ddlforge partition convert --table <table> --key <column> [options]
+  ddlforge partition attach --parent <tbl> --partition <part> --from <val> --to <val> [options]
+  ddlforge partition detach --parent <tbl> --partition <part> [--concurrent] [options]
+  ddlforge partition maintenance --parent <tbl> [options]
+
+SUBCOMMANDS:
+  convert             Generate zero-downtime 4-phase monolithic table conversion script
+  attach              Generate safe scan-skipping partition attachment script (3-phase)
+  detach              Generate safe autocommit-safe partition detachment script
+  maintenance         Generate rolling forward pre-allocation and retention pruning procedure
+
+CONVERT FLAGS:
+  --table <table>     Monolithic table name to convert (required)
+  --key <column>      Partition key column (required)
+  --type <range|list> Partition strategy: range | list (default: range)
+  --pk <col>          Primary key column for keyset backfill (default: id)
+  --batch-size <n>    Backfill batch size per commit (default: 5000)
+  --throttle-ms <n>   Jittered sleep throttle between batches in ms (default: 50)
+  --schema <name>     Target PostgreSQL schema (default: public)
+
+ATTACH FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --partition <part>  Partition table name to attach (required)
+  --from <val>        Lower partition boundary value (required)
+  --to <val>          Upper partition boundary value (required)
+  --key <col>         Partition key column name (default: created_at)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --constraint-name <name> Boundary CHECK constraint name (default: <part>_bnd_chk)
+
+DETACH FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --partition <part>  Partition table name to detach (required)
+  --concurrent        Execute concurrent autocommit detachment (default: true)
+  --no-concurrent     Execute standard non-concurrent detachment
+  --schema <name>     Target PostgreSQL schema (default: public)
+
+MAINTENANCE FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --interval <type>   Partition interval: monthly | daily (default: monthly)
+  --premake <n>       Number of future partitions to pre-allocate (default: 3)
+  --retention <n>     Number of intervals before detachment (default: 12)
+  --lock-timeout <t>  Bounded lock timeout during maintenance (default: 2s)
+  --schema <name>     Target PostgreSQL schema (default: public)
 
 ── RUN (autonomous circuit breaker execution) ────────────────────────
   ddlforge run <file.sql> --db <url> [options]
@@ -621,6 +667,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect mask subcommand
   if (argv[0] === 'mask') {
     return runMask(argv.slice(1));
+  }
+
+  // Detect partition subcommand (declarative partition lifecycle)
+  if (argv[0] === 'partition') {
+    return runPartition(argv.slice(1));
   }
 
   // Detect run subcommand (autonomous circuit breaker)
@@ -1955,4 +2006,597 @@ FLAGS:
     await client.end().catch(() => {});
   }
 }
+
+/**
+ * Executes the `ddlforge partition` subcommand.
+ */
+export async function runPartition(argv: string[]): Promise<number> {
+  const sub = argv[0];
+
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge partition <convert|attach|detach|maintenance> [options]
+
+Declarative Partition Lifecycle, Online Conversion, and Safe Attachment/Detachment.
+
+SUBCOMMANDS:
+  convert             Generate zero-downtime 4-phase monolithic table conversion script
+  attach              Generate safe scan-skipping partition attachment script (3-phase)
+  detach              Generate safe autocommit-safe partition detachment script
+  maintenance         Generate rolling forward pre-allocation and retention pruning procedure
+
+FLAGS:
+  --help, -h          Print this help message and exit
+
+Run "ddlforge partition <subcommand> --help" for detailed options.
+`);
+    return 0;
+  }
+
+  // Handle convert
+  if (sub === 'convert') {
+    let table = '';
+    let key = '';
+    let type: 'range' | 'list' = 'range';
+    let pk = 'id';
+    let batchSize = 5000;
+    let throttleMs = 50;
+    let schema = 'public';
+    let shadowTable = '';
+    let archiveTable = '';
+    let viewName = '';
+
+    let i = 1;
+    while (i < argv.length) {
+      const arg = argv[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge partition convert --table <table> --key <column> [options]
+
+Generate zero-downtime 4-phase monolithic table conversion SQL.
+
+FLAGS:
+  --table <table>     Monolithic table name to convert (required)
+  --key <column>      Partition key column (required)
+  --type <range|list> Partition strategy: range | list (default: range)
+  --pk <col>          Primary key column for keyset backfill (default: id)
+  --batch-size <n>    Backfill batch size per commit (default: 5000)
+  --throttle-ms <n>   Jittered sleep throttle between batches in ms (default: 50)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --shadow-table <t>  Shadow partitioned table name (default: <table_name>_parted)
+  --archive-table <t> Legacy archive table name (default: <table_name>_legacy)
+  --view-name <v>     Updatable view abstraction name (default: <table_name>_view)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < argv.length) table = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--key') {
+        i++;
+        if (i < argv.length) key = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--key=')) {
+        key = arg.slice('--key='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--type') {
+        i++;
+        if (i < argv.length) {
+          const t = argv[i].toLowerCase();
+          if (t === 'range' || t === 'list') type = t;
+        }
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--type=')) {
+        const t = arg.slice('--type='.length).toLowerCase();
+        if (t === 'range' || t === 'list') type = t;
+        i++;
+        continue;
+      }
+      if (arg === '--pk') {
+        i++;
+        if (i < argv.length) pk = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--pk=')) {
+        pk = arg.slice('--pk='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--batch-size') {
+        i++;
+        if (i < argv.length) batchSize = parseInt(argv[i], 10) || 5000;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--batch-size=')) {
+        batchSize = parseInt(arg.slice('--batch-size='.length), 10) || 5000;
+        i++;
+        continue;
+      }
+      if (arg === '--throttle-ms') {
+        i++;
+        if (i < argv.length) throttleMs = parseInt(argv[i], 10) || 50;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--throttle-ms=')) {
+        throttleMs = parseInt(arg.slice('--throttle-ms='.length), 10) || 50;
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < argv.length) schema = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--shadow-table') {
+        i++;
+        if (i < argv.length) shadowTable = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--shadow-table=')) {
+        shadowTable = arg.slice('--shadow-table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--archive-table') {
+        i++;
+        if (i < argv.length) archiveTable = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--archive-table=')) {
+        archiveTable = arg.slice('--archive-table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--view-name') {
+        i++;
+        if (i < argv.length) viewName = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--view-name=')) {
+        viewName = arg.slice('--view-name='.length);
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!table) {
+      console.error('ddlforge partition convert: --table <table> flag is required.');
+      return 1;
+    }
+    if (!key) {
+      console.error('ddlforge partition convert: --key <column> flag is required.');
+      return 1;
+    }
+
+    const { generatePartitionConversion } = await import('./partition/convert.js');
+    const result = generatePartitionConversion({
+      table,
+      key,
+      type,
+      primaryKey: pk,
+      batchSize,
+      throttleMs,
+      schema,
+      shadowTable: shadowTable || undefined,
+      archiveTable: archiveTable || undefined,
+      viewName: viewName || undefined,
+    });
+    console.log(result.fullSql);
+    return 0;
+  }
+
+  // Handle attach
+  if (sub === 'attach') {
+    let parent = '';
+    let partition = '';
+    let fromVal: string | number = '';
+    let toVal: string | number = '';
+    let key = '';
+    let schema = 'public';
+    let constraintName = '';
+
+    let i = 1;
+    while (i < argv.length) {
+      const arg = argv[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge partition attach --parent <tbl> --partition <part> --from <val> --to <val> [options]
+
+Generate safe 3-phase scan-skipping partition attachment SQL.
+
+FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --partition <part>  Partition table name to attach (required)
+  --from <val>        Lower partition boundary value (required)
+  --to <val>          Upper partition boundary value (required)
+  --key <col>         Partition key column name (default: created_at)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --constraint-name <name> Boundary CHECK constraint name (default: <part>_bnd_chk)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--parent') {
+        i++;
+        if (i < argv.length) parent = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--parent=')) {
+        parent = arg.slice('--parent='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--partition') {
+        i++;
+        if (i < argv.length) partition = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--partition=')) {
+        partition = arg.slice('--partition='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--from') {
+        i++;
+        if (i < argv.length) fromVal = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--from=')) {
+        fromVal = arg.slice('--from='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--to') {
+        i++;
+        if (i < argv.length) toVal = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--to=')) {
+        toVal = arg.slice('--to='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--key') {
+        i++;
+        if (i < argv.length) key = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--key=')) {
+        key = arg.slice('--key='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < argv.length) schema = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--constraint-name') {
+        i++;
+        if (i < argv.length) constraintName = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--constraint-name=')) {
+        constraintName = arg.slice('--constraint-name='.length);
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!parent) {
+      console.error('ddlforge partition attach: --parent <tbl> flag is required.');
+      return 1;
+    }
+    if (!partition) {
+      console.error('ddlforge partition attach: --partition <part> flag is required.');
+      return 1;
+    }
+    if (fromVal === '') {
+      console.error('ddlforge partition attach: --from <val> flag is required.');
+      return 1;
+    }
+    if (toVal === '') {
+      console.error('ddlforge partition attach: --to <val> flag is required.');
+      return 1;
+    }
+
+    const { generatePartitionAttachment } = await import('./partition/attach.js');
+    const result = generatePartitionAttachment({
+      parent,
+      partition,
+      from: fromVal,
+      to: toVal,
+      key: key || undefined,
+      schema,
+      constraintName: constraintName || undefined,
+    });
+    console.log(result.fullSql);
+    return 0;
+  }
+
+  // Handle detach
+  if (sub === 'detach') {
+    let parent = '';
+    let partition = '';
+    let concurrent = true;
+    let schema = 'public';
+
+    let i = 1;
+    while (i < argv.length) {
+      const arg = argv[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge partition detach --parent <tbl> --partition <part> [--concurrent] [options]
+
+Generate safe partition detachment SQL with PG14-PG16 FK anomaly remediation.
+
+FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --partition <part>  Partition table name to detach (required)
+  --concurrent        Execute concurrent autocommit detachment (default: true)
+  --no-concurrent     Execute standard non-concurrent detachment
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--parent') {
+        i++;
+        if (i < argv.length) parent = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--parent=')) {
+        parent = arg.slice('--parent='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--partition') {
+        i++;
+        if (i < argv.length) partition = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--partition=')) {
+        partition = arg.slice('--partition='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--concurrent') {
+        concurrent = true;
+        i++;
+        continue;
+      }
+      if (arg === '--no-concurrent') {
+        concurrent = false;
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < argv.length) schema = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!parent) {
+      console.error('ddlforge partition detach: --parent <tbl> flag is required.');
+      return 1;
+    }
+    if (!partition) {
+      console.error('ddlforge partition detach: --partition <part> flag is required.');
+      return 1;
+    }
+
+    const { generatePartitionDetachment } = await import('./partition/detach.js');
+    const result = generatePartitionDetachment({
+      parent,
+      partition,
+      concurrent,
+      schema,
+    });
+    console.log(result.fullSql);
+    return 0;
+  }
+
+  // Handle maintenance
+  if (sub === 'maintenance') {
+    let parent = '';
+    let interval: 'monthly' | 'daily' = 'monthly';
+    let premake = 3;
+    let retention = 12;
+    let schema = 'public';
+    let key = 'created_at';
+    let procedureName = '';
+    let lockTimeout = '2s';
+
+    let i = 1;
+    while (i < argv.length) {
+      const arg = argv[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge partition maintenance --parent <tbl> [options]
+
+Generate automated rolling partition maintenance procedure.
+
+FLAGS:
+  --parent <tbl>      Parent partitioned table name (required)
+  --interval <type>   Partition interval: monthly | daily (default: monthly)
+  --premake <n>       Number of future partitions to pre-allocate (default: 3)
+  --retention <n>     Number of intervals before detachment (default: 12)
+  --key <col>         Partition key column (default: created_at)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --procedure <name>  Custom stored procedure name
+  --lock-timeout <t>  Bounded lock timeout during maintenance (default: 2s)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--parent') {
+        i++;
+        if (i < argv.length) parent = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--parent=')) {
+        parent = arg.slice('--parent='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--interval') {
+        i++;
+        if (i < argv.length) {
+          const inv = argv[i].toLowerCase();
+          if (inv === 'monthly' || inv === 'daily') interval = inv;
+        }
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--interval=')) {
+        const inv = arg.slice('--interval='.length).toLowerCase();
+        if (inv === 'monthly' || inv === 'daily') interval = inv;
+        i++;
+        continue;
+      }
+      if (arg === '--premake') {
+        i++;
+        if (i < argv.length) premake = parseInt(argv[i], 10) || 3;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--premake=')) {
+        premake = parseInt(arg.slice('--premake='.length), 10) || 3;
+        i++;
+        continue;
+      }
+      if (arg === '--retention') {
+        i++;
+        if (i < argv.length) retention = parseInt(argv[i], 10) || 12;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--retention=')) {
+        retention = parseInt(arg.slice('--retention='.length), 10) || 12;
+        i++;
+        continue;
+      }
+      if (arg === '--key') {
+        i++;
+        if (i < argv.length) key = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--key=')) {
+        key = arg.slice('--key='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < argv.length) schema = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--procedure') {
+        i++;
+        if (i < argv.length) procedureName = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--procedure=')) {
+        procedureName = arg.slice('--procedure='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--lock-timeout') {
+        i++;
+        if (i < argv.length) lockTimeout = argv[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--lock-timeout=')) {
+        lockTimeout = arg.slice('--lock-timeout='.length);
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!parent) {
+      console.error('ddlforge partition maintenance: --parent <tbl> flag is required.');
+      return 1;
+    }
+
+    const { generatePartitionMaintenance } = await import('./partition/maintenance.js');
+    const result = generatePartitionMaintenance({
+      parent,
+      interval,
+      premake,
+      retention,
+      key,
+      schema,
+      procedureName: procedureName || undefined,
+      lockTimeout,
+    });
+    console.log(result.fullSql);
+    return 0;
+  }
+
+  console.error(`ddlforge partition: Unknown subcommand "${sub}". Supported subcommands: convert, attach, detach, maintenance.`);
+  return 1;
+}
+
 

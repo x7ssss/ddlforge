@@ -37,3 +37,7 @@ export * from './diff/index.js';
 
 // Masking (In-Flight Data Masking & Anonymization Engine)
 export * from './masking/index.js';
+
+// Partition (Declarative Partition Lifecycle, Conversion & Attachment)
+export * from './partition/index.js';
+

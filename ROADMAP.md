@@ -119,7 +119,42 @@
 - **Rich Terminal & JSON Formatters**: Colorized terminal output with badges (`[ROOT BLOCKER]`, `[HOLDER]`, `[WAITING]`) and structured JSON output for observability pipelines.
 - CLI command: `ddlforge top --db <url> [--watch] [--format terminal|json]`.
 
-### 3. Test Suite
+### 3. Test Suite (589 tests, 0 failures)
 - `test/cluster/circuitBreaker.test.ts`: Decorrelated jitter bounds verification across 500 iterations, non-deterministic variation, error classification (55P03, 57014, text indicators), event emission (`tripped`, `retry`, `success`), mock pool lifecycle.
 - `test/cluster/deadlockGraph.test.ts`: 2-node reciprocal cycle, 3-node circular wait, linear wait chain, clean graph, root blocker calculation, terminal and JSON formatters.
-- `test/cluster/cli.test.ts`: CLI help flags, missing argument error reporting, environment variable fallbacks, and dispatch routing for `ddlforge run` and `ddlforge top`.
+- `test/cluster/cli.test.ts`: CLI help flags, missing argument error reporting, environment variable fallbacks, and dispatch routing for `ddlforge run` and `ddlforge top`.
+
+---
+
+## ✅ v1.4.0: Declarative Partition Lifecycle, Online Conversion & Safe Attachment (COMPLETED)
+
+### 1. Online Monolithic Table Conversion Generator (`src/partition/convert.ts`)
+- **4-Phase Zero-Downtime Pipeline**:
+  - **Phase 1 (Expand)**: Creates shadow partitioned table (`<table_name>_parted`) with matching schema defaults, constraints, and catch-all default partition to safely handle out-of-range writes during conversion.
+  - **Phase 2 (Scaffolding)**: Creates updatable view abstraction (`<table_name>_view`) and bidirectional triggers (`trg_route_to_parted` and `trg_route_to_legacy`) guarded by `pg_trigger_depth() > 1`.
+  - **Phase 3 (Backfill)**: Generates crash-safe keyset-paginated stored procedure (`WHERE id > v_last_id ORDER BY id ASC LIMIT batch_size FOR UPDATE SKIP LOCKED ON CONFLICT DO NOTHING`) with loop commits and jittered sleep throttling (`pg_sleep`).
+  - **Phase 4 (Contract & Cutover)**: Sub-millisecond atomic rename swap on `pg_class.relname` under `SET LOCAL lock_timeout = '2s'` protection.
+- CLI command: `ddlforge partition convert --table <table> --key <column> [--type range|list] [--pk <id>] [--batch-size <n>] [--throttle-ms <n>]`.
+
+### 2. Scan-Skipping Partition Attacher (`src/partition/attach.ts`)
+- **3-Phase Lock-Safe Attachment**:
+  - **Phase 1 (Instantaneous Constraint)**: Adds boundary CHECK constraint matching partition bounds with `NOT VALID` (`convalidated = false`, sub-millisecond lock).
+  - **Phase 2 (Concurrent Validation)**: Validates constraint under `ShareUpdateExclusiveLock` without blocking concurrent OLTP reads or writes.
+  - **Phase 3 (Fast Attach & Redundant Cleanup)**: PostgreSQL recognizes `convalidated = true` and skips table sequential scan, taking an `AccessExclusiveLock` only for metadata update, followed by dropping the redundant check constraint.
+- CLI command: `ddlforge partition attach --parent <tbl> --partition <part> --from <val> --to <val> [--key <col>]`.
+
+### 3. Concurrent Partition Detacher & Retention Procedure (`src/partition/detach.ts` & `src/partition/maintenance.ts`)
+- **Concurrent Detachment**: Emits autocommit-safe `ALTER TABLE ... DETACH PARTITION ... CONCURRENTLY` (PG14+) avoiding heavy parent table exclusive locks.
+- **FK Trigger Anomaly Remediation**: Automates catalog inspection and validation on detached partitions to fix PG14-PG16 sub-FK detachment anomalies.
+- **Automated Rolling Maintenance Procedure**: Generates autonomous stored procedures pre-allocating forward partitions (`premake` buffer) and pruning expired partitions beyond `retention` window under bounded `SET LOCAL lock_timeout = '2s'` protection.
+- CLI commands:
+  - `ddlforge partition detach --parent <tbl> --partition <part> [--concurrent]`
+  - `ddlforge partition maintenance --parent <tbl> [--interval monthly|daily] [--premake <n>] [--retention <n>]`
+
+### 4. Test Suite
+- `test/partition/convert.test.ts`: 4-phase conversion generation, list/range strategies, view abstractions, keyset pagination, and input validation.
+- `test/partition/attach.test.ts`: Scan-skipping 3-phase execution, bound literal formatting, quote escaping, and validation errors.
+- `test/partition/detach.test.ts`: Concurrent autocommit detachment, non-concurrent transaction blocks, and FK anomaly remediation.
+- `test/partition/maintenance.test.ts`: Daily/monthly forward pre-allocation, retention detachment loops, and lock timeout protections.
+- `test/partition/cli.test.ts`: CLI help flags, subcommand routing, and missing argument validation for convert, attach, detach, maintenance.
+
