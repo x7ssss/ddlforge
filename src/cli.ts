@@ -10,13 +10,14 @@ import { formatTerminal } from './reporters/terminal.js';
 import { formatJson } from './reporters/json.js';
 import { formatMarkdown } from './reporters/markdown.js';
 import { formatSarif } from './reporters/sarif.js';
+import { formatGithub } from './reporters/github.js';
 // executor is imported dynamically inside runApply() to preserve
 // zero-dependency invariant for static linting (ddlforge check).
 
 export interface CliOptions {
   targets: string[];
   pgVersion: number;
-  format: 'terminal' | 'json' | 'markdown' | 'sarif';
+  format: 'terminal' | 'json' | 'markdown' | 'sarif' | 'github';
   output?: string;
   quiet: boolean;
   changedOnly: boolean;
@@ -38,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.9.0';
+export const VERSION = '1.0.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -121,7 +122,7 @@ export function parseArgs(args: string[]): CliOptions {
         const fmt = args[i].toLowerCase();
         if (fmt === 'pretty') {
           options.format = 'terminal';
-        } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
+        } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif' || fmt === 'github') {
           options.format = fmt;
         }
       }
@@ -132,7 +133,7 @@ export function parseArgs(args: string[]): CliOptions {
       const fmt = arg.slice(9).toLowerCase();
       if (fmt === 'pretty') {
         options.format = 'terminal';
-      } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif') {
+      } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif' || fmt === 'github') {
         options.format = fmt;
       }
       i++;
@@ -163,6 +164,7 @@ USAGE:
   ddlforge expand <file.sql> --version <v> # generate virtual schema views with INSTEAD OF triggers
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
+  ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
 
 ── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
@@ -170,12 +172,16 @@ ARGUMENTS:
 
 FLAGS:
   --pg <version>      Target PostgreSQL version (default: 16)
-  --format <type>     Output format: terminal | json | markdown | sarif (default: terminal)
+  --format <type>     Output format: terminal | json | markdown | sarif | github (default: terminal)
   --quiet, -q         Suppress advisories/warnings and emit blockers only
   --changed-only      Use git diff to lint only staged or branch-modified migration files
   --fix               Automatically apply safe remediation recipes in-place for detected blockers
   --version, -v       Print ddlforge version and exit
   --help, -h          Print this help message and exit
+
+  GitHub CI usage:
+    ddlforge check ./migrations --format github
+    # Emits ::error and ::warning workflow commands for inline PR annotations
 
 ── EXPAND (virtual schema) ───────────────────────────────────────────
   ddlforge expand <migration-file.sql> --version <v1|v2>
@@ -529,6 +535,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return runContract(argv.slice(1));
   }
 
+  // Detect test subcommand
+  if (argv[0] === 'test') {
+    return runTest(argv.slice(1));
+  }
+
   // Explicit check subcommand (e.g. ddlforge check ...)
   if (argv[0] === 'check') {
     argv = argv.slice(1);
@@ -556,6 +567,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       emptyOutput = formatMarkdown([]);
     } else if (options.format === 'sarif') {
       emptyOutput = formatSarif([]);
+    } else if (options.format === 'github') {
+      emptyOutput = ''; // no annotations needed for empty set
     } else {
       emptyOutput = 'No migration .sql files found to analyze.';
     }
@@ -610,6 +623,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     formattedOutput = formatMarkdown(results);
   } else if (options.format === 'sarif') {
     formattedOutput = formatSarif(results);
+  } else if (options.format === 'github') {
+    formattedOutput = formatGithub(results);
   } else {
     formattedOutput = formatTerminal(results, { quiet: options.quiet });
   }
@@ -618,6 +633,9 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     const outPath = path.isAbsolute(options.output) ? options.output : path.resolve(process.cwd(), options.output);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, formattedOutput, 'utf-8');
+  } else if (options.format === 'github') {
+    // Write workflow commands directly to stdout (bypasses console.log newline buffering)
+    process.stdout.write(formattedOutput + (formattedOutput.length > 0 ? '\n' : ''));
   } else {
     console.log(formattedOutput);
   }
@@ -1094,4 +1112,108 @@ FLAGS:
 
   console.log(result.scriptSql);
   return 0;
+}
+
+/**
+ * Executes the `ddlforge test` subcommand.
+ *
+ * Spins up an ephemeral postgres:17-alpine container via Testcontainers,
+ * runs one or more migration SQL files against it, and asserts that
+ * AccessExclusiveLock hold durations do not exceed --max-lock-ms.
+ *
+ * Requires DOCKER_AVAILABLE=true to be set, or Docker to be running locally.
+ */
+export async function runTest(argv: string[]): Promise<number> {
+  let files: string[] = [];
+  let maxLockMs = 500;
+  let image = 'postgres:17-alpine';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge test — Run migrations against ephemeral PostgreSQL container with lock assertion
+
+USAGE:
+  ddlforge test [<file.sql>...] [flags]
+
+ARGUMENTS:
+  <file.sql>...        One or more migration SQL files to run (default: auto-discover)
+
+FLAGS:
+  --max-lock-ms <n>    Maximum AccessExclusiveLock hold time in milliseconds (default: 500)
+  --image <image>      PostgreSQL container image (default: postgres:17-alpine)
+  --help, -h           Print this help message and exit
+
+ENVIRONMENT:
+  DOCKER_AVAILABLE=true          Required to enable real container tests
+  TESTCONTAINERS_RYUK_DISABLED   Set to 'true' to disable Ryuk reaper in CI
+  DDLFORGE_TEST_PG_IMAGE         Override container image without --image flag
+
+EXAMPLES:
+  $ ddlforge test ./migrations/001_add_index.sql
+  $ ddlforge test ./prisma/migrations --max-lock-ms 300
+  $ DOCKER_AVAILABLE=true ddlforge test ./drizzle --image postgres:16-alpine
+`);
+      return 0;
+    }
+
+    const nextArg = () => { i++; return i < argv.length ? argv[i] : ''; };
+
+    if (arg === '--max-lock-ms') { maxLockMs = parseInt(nextArg(), 10) || 500; i++; continue; }
+    if (arg.startsWith('--max-lock-ms=')) { maxLockMs = parseInt(arg.slice('--max-lock-ms='.length), 10) || 500; i++; continue; }
+
+    if (arg === '--image') { image = nextArg(); i++; continue; }
+    if (arg.startsWith('--image=')) { image = arg.slice('--image='.length); i++; continue; }
+
+    if (!arg.startsWith('-')) {
+      files.push(arg);
+    }
+
+    i++;
+  }
+
+  // Check Docker availability guard
+  if (process.env['DOCKER_AVAILABLE'] !== 'true') {
+    console.warn('[ddlforge test] Skipping: DOCKER_AVAILABLE is not set to "true".');
+    console.warn('[ddlforge test] Set DOCKER_AVAILABLE=true to enable ephemeral container tests.');
+    console.warn('[ddlforge test] This is a safety guard to avoid accidental Docker pulls in non-CI environments.');
+    return 0;
+  }
+
+  // Discover SQL files if none specified
+  if (files.length === 0) {
+    files = discoverSqlFiles([], false);
+  }
+
+  if (files.length === 0) {
+    console.error('[ddlforge test] No migration SQL files found to run.');
+    return 1;
+  }
+
+  // Resolve and read SQL files
+  const migrations: string[] = [];
+  for (const file of files) {
+    const fullPath = path.isAbsolute(file) ? file : path.resolve(process.cwd(), file);
+    if (!fs.existsSync(fullPath)) {
+      console.error(`[ddlforge test] File not found: "${file}"`);
+      return 1;
+    }
+    migrations.push(fs.readFileSync(fullPath, 'utf-8'));
+  }
+
+  console.log(`[ddlforge test] Starting ephemeral ${image} container...`);
+  console.log(`[ddlforge test] Running ${migrations.length} migration(s) with maxLockMs=${maxLockMs}ms`);
+
+  const { runContainerTests } = await import('./harness/testHarness.js');
+  const result = await runContainerTests({
+    migrations,
+    maxLockMs,
+    image,
+  });
+
+  console.log(result.summary);
+  return result.passed ? 0 : 1;
 }

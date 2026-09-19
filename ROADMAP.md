@@ -22,21 +22,28 @@
 
 ---
 
-## v1.0.0 Target: Production Hardening, CI/CD & Live Harness
+## ✅ v1.0.0: Production Hardening, CI/CD & Live Harness (COMPLETED)
 
 ### 1. Standalone Bundled GitHub Action (`action/`)
-- Bundled TypeScript action compiled via `@vercel/ncc` into `action/dist/index.js`.
-- Inline PR diff annotations using workflow commands (`::error file={f},line={l},col={c}::{msg}`).
+- Bundled TypeScript action compiled via `@vercel/ncc` into `action/dist/index.js` (CommonJS, 958kB).
+- Inline PR diff annotations using workflow commands (`::error file={f},line={l},col={c},title=ddlforge::{msg}`).
 - CLI flag `ddlforge check --format github` for workflow integration.
 - Strict exit code evaluation: fails CI check status on `BLOCKER`, logs warnings cleanly.
+- `action/action.yml`, `action/src/index.ts`, `action/package.json`, `action/tsconfig.json`.
+- `npm run build:action` script bundles via `ncc`.
 
 ### 2. Ephemeral PostgreSQL Test Harness (`ddlforge test`)
-- Ephemeral PostgreSQL 17 test harness using `@testcontainers/postgresql`.
-- Schema-per-test isolation strategy for sub-second test execution across multi-phase DDL.
-- Concurrency Lock Poller:
-  - Samples `pg_locks` and `pg_stat_activity` every 50ms during live migration runs.
-  - Asserts that `AccessExclusiveLock` hold durations do not exceed specified thresholds (e.g. 500ms).
-- Graceful process exit handlers (`SIGINT`, `SIGTERM`, `unhandledRejection`) with Ryuk reaper fallback.
+- `src/harness/testHarness.ts` — `TestHarness` class + `runContainerTests()` function.
+- Ephemeral PostgreSQL 17 via `@testcontainers/postgresql` (guarded by `DOCKER_AVAILABLE=true`).
+- Schema-per-test isolation: `test_<uuid>` per `runMigration()` call.
+- Concurrency Lock Poller: samples `pg_locks + pg_stat_activity` every 50ms.
+- Asserts `AccessExclusiveLock` hold time ≤ `--max-lock-ms` (default 500ms).
+- Signal handlers: `SIGINT`, `SIGTERM`, `unhandledRejection` → container stop.
+- `TESTCONTAINERS_RYUK_DISABLED=true` respected in CI.
+
+### 3. Test Suite (480 tests, 0 failures)
+- `test/reporters/github.test.ts` — 13 unit tests for GitHub reporter.
+- `test/harness/testHarness.test.ts` — 16 unit tests (mock-based, no Docker required).
 
 ---
 

@@ -1,0 +1,45 @@
+name: ddlforge
+description: >
+  Ultra-fast, zero-dependency Postgres migration lock linter.
+  Checks migration SQL files for dangerous lock patterns and data-loss risks,
+  and annotates Pull Requests with inline error/warning comments.
+
+author: ddlforge
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  migration-dir:
+    description: >
+      Path (relative to GITHUB_WORKSPACE) to the migration directory or file.
+      Supports prisma/migrations, drizzle, ./migrations, or any .sql file.
+    required: false
+    default: ''
+  severity-threshold:
+    description: >
+      Minimum severity to annotate. One of: BLOCKER | WARNING | ADVISORY.
+      Defaults to WARNING (i.e. annotate both WARNINGs and BLOCKERs).
+    required: false
+    default: 'WARNING'
+  format:
+    description: >
+      Output format passed to ddlforge check. One of: github | terminal | json | markdown | sarif.
+      Defaults to "github" for inline PR annotations.
+    required: false
+    default: 'github'
+  pg-version:
+    description: Target PostgreSQL version for rule evaluation (default: 16).
+    required: false
+    default: '16'
+
+outputs:
+  blockers:
+    description: Number of BLOCKER findings detected.
+  warnings:
+    description: Number of WARNING findings detected.
+
+runs:
+  using: node20
+  main: dist/index.js
