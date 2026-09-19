@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.6.0';
+export const VERSION = '1.7.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -174,6 +174,36 @@ USAGE:
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
   ddlforge doctor [options]                # continuous WAL archival health & disaster recovery readiness
   ddlforge verify-backup [options]         # verify restored instance health, recovery state & amcheck
+  ddlforge compact <estimate|table|index>  # zero-downtime table compaction & bloat estimator
+
+── COMPACT (zero-downtime table compaction & bloat estimator) ──────
+  ddlforge compact estimate [options]
+  ddlforge compact table --table <table> --pk <id> [options]
+  ddlforge compact index --table <table> [--index <name>]
+
+SUBCOMMANDS:
+  estimate            Mathematically estimate table and B-Tree index bloat without seqscans
+  table               Generate 5-phase zero-downtime online table repack SQL script
+  index               Generate autocommit-safe lock-free concurrent index rebuild statement
+
+TABLE REPACK FLAGS:
+  --table <table>     Monolithic table name to compact (required)
+  --pk <id>           Primary key column for keyset backfill (default: id)
+  --pk-type <type>    Primary key column data type (default: BIGINT)
+  --batch-size <n>    Backfill and replay batch size per commit (default: 5000)
+  --throttle-ms <n>   Jittered sleep throttle between batches in ms (default: 20)
+  --lock-timeout <t>  Cutover transaction lock timeout (default: 250ms)
+  --statement-timeout <t> Cutover statement timeout (default: 5s)
+  --fillfactor <n>    Fillfactor for repacked shadow table (e.g. 85 or 90)
+  --tablespace <name> Target tablespace for shadow table
+  --schema <name>     Target PostgreSQL schema (default: public)
+
+ESTIMATE FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL env var)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --threshold <pct>   Bloat percentage threshold for repack recommendation (default: 25)
+  --format <type>     Output format: terminal | json (default: terminal)
 
 ── DOCTOR (continuous WAL archiving & disaster recovery) ───────────
   ddlforge doctor [options]
@@ -739,6 +769,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect verify-backup subcommand (restored instance verification & amcheck)
   if (argv[0] === 'verify-backup') {
     return runVerifyBackup(argv.slice(1));
+  }
+
+  // Detect compact subcommand (zero-downtime table compaction & bloat estimator)
+  if (argv[0] === 'compact') {
+    return runCompact(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -3624,6 +3659,495 @@ FLAGS:
   } finally {
     await pool.end().catch(() => {});
   }
+}
+
+/**
+ * Executes the `ddlforge compact` subcommand.
+ */
+export async function runCompact(argv: string[]): Promise<number> {
+  const sub = argv[0];
+
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge compact <subcommand> [options]
+
+Zero-downtime table compaction, in-place defragmentation, and statistical bloat estimator.
+
+SUBCOMMANDS:
+  estimate            Mathematically estimate table and B-Tree index bloat without seqscans
+  table               Generate 5-phase zero-downtime online table repack SQL script
+  index               Generate autocommit-safe lock-free concurrent index rebuild statement
+
+EXAMPLES:
+  $ ddlforge compact estimate --db postgres://localhost/mydb
+  $ ddlforge compact table --table orders --pk id --batch-size 5000
+  $ ddlforge compact index --table orders --index idx_orders_customer
+`);
+    return 0;
+  }
+
+  // Subcommand 1: ddlforge compact estimate
+  if (sub === 'estimate') {
+    const subArgs = argv.slice(1);
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let table = '';
+    let schema = 'public';
+    let threshold = 25;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge compact estimate [options]
+
+Mathematically estimate table and B-Tree index bloat without sequential scans.
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL env var)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --threshold <pct>   Bloat percentage threshold for repack recommendation (default: 25)
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < subArgs.length) table = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < subArgs.length) schema = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--threshold') {
+        i++;
+        if (i < subArgs.length) threshold = parseInt(subArgs[i], 10) || 25;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--threshold=')) {
+        threshold = parseInt(arg.slice('--threshold='.length), 10) || 25;
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) {
+          format = subArgs[i] as any;
+        }
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl) {
+      console.error('ddlforge compact estimate: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { queryLiveBloatEstimates, formatBloatReportTerminal } = await import('./compaction/index.js');
+      const report = await queryLiveBloatEstimates(pool, {
+        schema,
+        table: table || undefined,
+        thresholdPercent: threshold,
+      });
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatBloatReportTerminal(report));
+      }
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge compact estimate error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  // Subcommand 2: ddlforge compact table
+  if (sub === 'table') {
+    const subArgs = argv.slice(1);
+    let table = '';
+    let pk = 'id';
+    let pkType = 'BIGINT';
+    let schema = 'public';
+    let batchSize = 5000;
+    let throttleMs = 20;
+    let shadowTable = '';
+    let logTable = '';
+    let archiveTable = '';
+    let tablespace = '';
+    let fillfactor: number | undefined;
+    let lockTimeout = '250ms';
+    let statementTimeout = '5s';
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge compact table --table <table> --pk <id> [options]
+
+Generate 5-phase zero-downtime online table repack SQL script.
+
+FLAGS:
+  --table <table>         Monolithic table name to compact (required)
+  --pk <id>               Primary key column for keyset backfill (default: id)
+  --pk-type <type>        Primary key column data type (default: BIGINT)
+  --batch-size <n>        Backfill and replay batch size per commit (default: 5000)
+  --throttle-ms <n>       Jittered sleep throttle between batches in ms (default: 20)
+  --lock-timeout <t>      Cutover transaction lock timeout (default: 250ms)
+  --statement-timeout <t> Cutover statement timeout (default: 5s)
+  --fillfactor <n>        Fillfactor for repacked shadow table (e.g. 85 or 90)
+  --tablespace <name>     Target tablespace for shadow table
+  --shadow-table <name>   Shadow table name (default: <table>_repack_shadow)
+  --log-table <name>      Change log table name (default: <table>_repack_log)
+  --archive-table <name>  Archive table name for legacy table (default: <table>_legacy)
+  --schema <name>         Target PostgreSQL schema (default: public)
+  --format <type>         Output format: terminal | json (default: terminal)
+  --help, -h              Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < subArgs.length) table = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--pk') {
+        i++;
+        if (i < subArgs.length) pk = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--pk=')) {
+        pk = arg.slice('--pk='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--pk-type') {
+        i++;
+        if (i < subArgs.length) pkType = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--pk-type=')) {
+        pkType = arg.slice('--pk-type='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < subArgs.length) schema = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--batch-size') {
+        i++;
+        if (i < subArgs.length) batchSize = parseInt(subArgs[i], 10) || 5000;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--batch-size=')) {
+        batchSize = parseInt(arg.slice('--batch-size='.length), 10) || 5000;
+        i++;
+        continue;
+      }
+      if (arg === '--throttle-ms') {
+        i++;
+        if (i < subArgs.length) throttleMs = parseInt(subArgs[i], 10) || 20;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--throttle-ms=')) {
+        throttleMs = parseInt(arg.slice('--throttle-ms='.length), 10) || 20;
+        i++;
+        continue;
+      }
+      if (arg === '--lock-timeout') {
+        i++;
+        if (i < subArgs.length) lockTimeout = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--lock-timeout=')) {
+        lockTimeout = arg.slice('--lock-timeout='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--statement-timeout') {
+        i++;
+        if (i < subArgs.length) statementTimeout = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--statement-timeout=')) {
+        statementTimeout = arg.slice('--statement-timeout='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--fillfactor') {
+        i++;
+        if (i < subArgs.length) fillfactor = parseInt(subArgs[i], 10) || undefined;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--fillfactor=')) {
+        fillfactor = parseInt(arg.slice('--fillfactor='.length), 10) || undefined;
+        i++;
+        continue;
+      }
+      if (arg === '--tablespace') {
+        i++;
+        if (i < subArgs.length) tablespace = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--tablespace=')) {
+        tablespace = arg.slice('--tablespace='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--shadow-table') {
+        i++;
+        if (i < subArgs.length) shadowTable = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--shadow-table=')) {
+        shadowTable = arg.slice('--shadow-table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--log-table') {
+        i++;
+        if (i < subArgs.length) logTable = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--log-table=')) {
+        logTable = arg.slice('--log-table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--archive-table') {
+        i++;
+        if (i < subArgs.length) archiveTable = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--archive-table=')) {
+        archiveTable = arg.slice('--archive-table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) {
+          format = subArgs[i] as any;
+        }
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!table) {
+      console.error('ddlforge compact table: --table <table> flag is required.');
+      return 1;
+    }
+
+    const { generateTableRepack } = await import('./compaction/index.js');
+    const { generateAdvisoryKey } = await import('./cluster/advisory.js');
+    const advisoryKey = generateAdvisoryKey('repack', `${schema}:${table}`);
+
+    const result = generateTableRepack({
+      table,
+      primaryKey: pk,
+      primaryKeyType: pkType,
+      schema,
+      batchSize,
+      throttleMs,
+      shadowTable: shadowTable || undefined,
+      logTable: logTable || undefined,
+      archiveTable: archiveTable || undefined,
+      tablespace: tablespace || undefined,
+      fillfactor,
+      lockTimeout,
+      statementTimeout,
+    });
+
+    if (format === 'json') {
+      console.log(
+        JSON.stringify(
+          {
+            table,
+            schema,
+            primaryKey: pk,
+            advisoryKey: advisoryKey.toString(),
+            phases: {
+              phase1: result.phase1Sql,
+              phase2: result.phase2Sql,
+              phase3: result.phase3Sql,
+              phase4: result.phase4Sql,
+              phase5: result.phase5Sql,
+            },
+            fullSql: result.fullSql,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(`-- ============================================================================
+-- ddlforge v${VERSION} — Zero-Downtime Table Compaction Script (Online Repack)
+-- Target Relation: "${schema}"."${table}"
+-- Primary Key:     "${pk}" (${pkType})
+-- Advisory Lock:   ${advisoryKey.toString()} (ddlforge:repack:${schema}:${table})
+-- ============================================================================
+
+${result.fullSql}`);
+    }
+    return 0;
+  }
+
+  // Subcommand 3: ddlforge compact index
+  if (sub === 'index') {
+    const subArgs = argv.slice(1);
+    let table = '';
+    let index = '';
+    let schema = 'public';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge compact index --table <table> [--index <name>] [options]
+
+Generate autocommit-safe lock-free concurrent index rebuild statement.
+
+FLAGS:
+  --table <table>     Target table name (required)
+  --index <name>      Target index name (optional, defaults to rebuilding all table indexes)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < subArgs.length) table = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--index') {
+        i++;
+        if (i < subArgs.length) index = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--index=')) {
+        index = arg.slice('--index='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < subArgs.length) schema = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!table) {
+      console.error('ddlforge compact index: --table <table> flag is required.');
+      return 1;
+    }
+
+    const { generateReindexScript } = await import('./compaction/index.js');
+    const result = generateReindexScript({
+      table,
+      index: index || undefined,
+      schema,
+    });
+
+    console.log(`-- ${result.explanation}\n${result.sql}`);
+    return 0;
+  }
+
+  console.error(`ddlforge compact: Unknown subcommand "${sub}". Supported subcommands: estimate, table, index.`);
+  return 1;
 }
 
 

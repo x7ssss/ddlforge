@@ -46,3 +46,6 @@ export * from './preflight/index.js';
 
 // Recovery (Continuous WAL Archiving, Backup RPO Auditor & Restore Verification Engine)
 export * from './recovery/index.js';
+
+// Compaction (Zero-Downtime Table Compaction & Online Repack Engine)
+export * from './compaction/index.js';

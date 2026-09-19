@@ -233,4 +233,44 @@
 - `test/recovery/backupAuditor.test.ts`: Unit tests for `pgbackrest` JSON manifest parser, catalog backup recording and queries, RPO calculation, and high-risk operation detection.
 - `test/recovery/verifyRestore.test.ts`: Unit tests for recovery completion assertion, amcheck B-Tree integrity verification, unvalidated foreign keys, and safety ledger recording.
 - `test/recovery/cli.test.ts`: Unit tests for `ddlforge doctor`, `ddlforge verify-backup`, and CLI help screens and options.
+
+---
+
+## ✅ v1.7.0: Zero-Downtime Table Compaction, In-Place Defragmentation, and Statistical Bloat Estimator (COMPLETED)
+
+### 1. Statistical Bloat Estimator Engine (`src/compaction/bloatEstimator.ts`)
+- **Zero-SeqScan Tuple Math**: Calculates table and B-Tree index bloat without sequential scans using `pg_stats`, `pg_class`, and explicit tuple layout math:
+  - 24-byte page header
+  - 4-byte `ItemIdData` line pointers
+  - 23-byte `HeapTupleHeaderData` padded to 24-byte `MAXALIGN = 8` on 64-bit architecture
+  - Dynamic null bitmap padding: `ceil(nullable_columns / 8)` bytes
+  - B-Tree leaf page capacity with 24-byte header, 16-byte special space, and 10% non-leaf btree overhead
+- **Heuristic Decision Matrix**:
+  - Index bloat > 30% and table bloat < 10%: recommends `ddlforge compact index` (rebuilds indexes concurrently without heap rewrites).
+  - Table bloat >= 25%: recommends `ddlforge compact table` (online repack).
+  - Table bloat 10-25%: flags as normal MVCC churn; recommends tuning fillfactor (e.g. 85 for HOT updates).
+  - Bloat < 10%: reports relation density as optimal.
+- **CLI Command**: `ddlforge compact estimate [--db <url>] [--table <table>] [--threshold <pct>] [--format terminal|json]`.
+
+### 2. Online Table Repack SQL Generator (`src/compaction/repack.ts`)
+- **5-Phase Zero-Downtime Pipeline**:
+  - **Phase 1 (Shadow Setup)**: Creates `<tbl>_repack_shadow` matching source schema, constraints, defaults, and indexes (`INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING INDEXES`) with optional custom `TABLESPACE` and `fillfactor`.
+  - **Phase 2 (Audit Change-Log Trigger)**: Creates `<tbl>_repack_log` and PL/pgSQL trigger capturing in-flight DML (`INSERT`, `UPDATE`, `DELETE`) with `pg_trigger_depth() < 2` guard preventing cascading loops.
+  - **Phase 3 (Keyset Snapshot Bulk Copy)**: Creates stored procedure `sp_repack_bulk_copy_<tbl>` with keyset pagination (`WHERE id > v_last_id ORDER BY id ASC LIMIT p_batch_size FOR UPDATE SKIP LOCKED ON CONFLICT (id) DO NOTHING`), per-batch `COMMIT;`, and jittered sleep throttling (`pg_sleep(v_throttle_sec * (0.8 + (random() * 0.4)))`).
+  - **Phase 4 (Catch-up Replay Loop)**: Creates stored procedure `sp_repack_replay_log_<tbl>` replay procedure hydrating payloads via `jsonb_populate_record(NULL::<shadow>, rec.payload)` and applying deletes/updates.
+  - **Phase 5 (Bounded Cutover Atomic Swap)**: Dedicated cutover transaction with `SET LOCAL lock_timeout = '250ms'` and `SET LOCAL statement_timeout = '5s'`: acquires `ACCESS EXCLUSIVE` lock on target table, drains final delta, validates row count parity (`src_count == shadow_count`), tears down triggers and procedures, and executes sub-millisecond atomic rename (`orders -> orders_legacy`, `orders_repack_shadow -> orders`).
+- **Advisory Lock Coordination**: Derives deterministic 64-bit cluster advisory lock via `generateAdvisoryKey('repack', '<schema>:<table>')`.
+- **CLI Command**: `ddlforge compact table --table <table> [--pk <id>] [--batch-size <n>] [--throttle-ms <n>] [--lock-timeout <t>] [--fillfactor <n>] [--format terminal|json]`.
+
+### 3. Lock-Safe Concurrent Index Reindexer (`src/compaction/reindex.ts`)
+- Generates autocommit-safe `REINDEX INDEX CONCURRENTLY` and `REINDEX TABLE CONCURRENTLY` statements.
+- Acquires `ShareUpdateExclusiveLock`, permitting concurrent reads, inserts, updates, and deletes.
+- Transaction context validator (`validateReindexTransactionContext`) rejects execution inside explicit transaction blocks to prevent PostgreSQL SQLSTATE 55000.
+- **CLI Command**: `ddlforge compact index --table <table> [--index <name>] [--schema <name>]`.
+
+### 4. Test Suite
+- `test/compaction/bloatEstimator.test.ts`: Unit tests for tuple header sizing across nullable column counts (0, 1-8, 9-16, 17-24, 25-32 cols), table bloat estimation, index bloat estimation, heuristic decision matrix, live catalog query mocking, and terminal formatting.
+- `test/compaction/repack.test.ts`: Unit tests for 5-phase SQL generator, keyset bulk copy procedure, JSONB replay rehydration, trigger depth guard, bounded cutover timeouts, and parity check assertions.
+- `test/compaction/reindex.test.ts`: Unit tests for concurrent index reindex syntax, table reindex syntax, and autocommit transaction context validation.
+- `test/compaction/cli.test.ts`: Unit tests for `ddlforge compact` CLI routing, `estimate`, `table`, and `index` subcommands, help screens, error handling, and JSON output formatting.
 
