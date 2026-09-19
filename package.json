@@ -1,6 +1,6 @@
 {
   "name": "ddlforge",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Ultra-fast, zero-runtime-dependency Postgres migration lock linter and data-loss prevention engine CLI in Node.js 20+ and TypeScript",
   "type": "module",
   "main": "./dist/src/index.js",
