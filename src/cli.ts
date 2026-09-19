@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -157,6 +157,8 @@ ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock lin
 
 USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
+  ddlforge run <file.sql> --db <url>       # execute migration with autonomous lock pre-emption
+  ddlforge top [options]                   # real-time lock contention & deadlock graph visualizer
   ddlforge diff [options]                  # compare live database schema against migration ASTs
   ddlforge lock <status|release> [options] # inspect or clear distributed advisory locks
   ddlforge mask <trigger|backfill|advice>  # in-flight data masking & PII anonymization
@@ -168,6 +170,28 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+
+── RUN (autonomous circuit breaker execution) ────────────────────────
+  ddlforge run <file.sql> --db <url> [options]
+
+ARGUMENTS:
+  <file.sql>          Migration SQL file to execute
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (required)
+  --max-queue <n>     Maximum blocked queries before pre-emption trip (default: 5)
+  --max-wait-ms <n>   Maximum wait time in ms before pre-emption trip (default: 200)
+  --retries <n>       Maximum retry attempts with decorrelated jitter (default: 50)
+  --base-delay-ms <n> Initial base delay in ms for backoff (default: 100)
+  --cap-delay-ms <n>  Maximum delay cap in ms for backoff (default: 5000)
+
+── TOP (deadlock & contention visualizer) ─────────────────────────────
+  ddlforge top --db <url> [options]
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (defaults to DATABASE_URL)
+  --format <type>     Output format: terminal | json (default: terminal)
+  --watch             Continuously refresh lock contention graph every 1s
 
 ── MASK (in-flight PII anonymization) ────────────────────────────────
   ddlforge mask trigger --table <table> --columns <col:type,...> [options]
@@ -597,6 +621,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect mask subcommand
   if (argv[0] === 'mask') {
     return runMask(argv.slice(1));
+  }
+
+  // Detect run subcommand (autonomous circuit breaker)
+  if (argv[0] === 'run') {
+    return runCircuitBreaker(argv.slice(1));
+  }
+
+  // Detect top subcommand (deadlock & contention visualizer)
+  if (argv[0] === 'top') {
+    return runTop(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -1649,3 +1683,276 @@ FLAGS:
   console.error(`ddlforge mask: Unknown subcommand "${sub}". Supported subcommands: trigger, backfill, advice.`);
   return 1;
 }
+
+/**
+ * Executes the `ddlforge run` subcommand.
+ */
+export async function runCircuitBreaker(argv: string[]): Promise<number> {
+  let file = '';
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let maxQueueDepth = 5;
+  let maxQueueWaitMs = 200;
+  let retries = 50;
+  let baseDelayMs = 100;
+  let capDelayMs = 5000;
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge run <file.sql> --db <url> [options]
+
+Execute a migration with autonomous lock pre-emption and decorrelated jitter.
+
+ARGUMENTS:
+  <file.sql>          Migration SQL file to execute
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (required, defaults to DATABASE_URL)
+  --max-queue <n>     Maximum blocked queries before pre-emption trip (default: 5)
+  --max-wait-ms <n>   Maximum wait time in ms before pre-emption trip (default: 200)
+  --retries <n>       Maximum retry attempts with decorrelated jitter (default: 50)
+  --base-delay-ms <n> Initial base delay in ms for backoff (default: 100)
+  --cap-delay-ms <n>  Maximum delay cap in ms for backoff (default: 5000)
+  --help, -h          Print this help message and exit
+`);
+      return 0;
+    }
+
+    if (arg === '--db') {
+      i++;
+      if (i < argv.length) dbUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      dbUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-queue') {
+      i++;
+      if (i < argv.length) maxQueueDepth = parseInt(argv[i], 10) || 5;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-queue=')) {
+      maxQueueDepth = parseInt(arg.slice('--max-queue='.length), 10) || 5;
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-wait-ms') {
+      i++;
+      if (i < argv.length) maxQueueWaitMs = parseInt(argv[i], 10) || 200;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-wait-ms=')) {
+      maxQueueWaitMs = parseInt(arg.slice('--max-wait-ms='.length), 10) || 200;
+      i++;
+      continue;
+    }
+
+    if (arg === '--retries') {
+      i++;
+      if (i < argv.length) retries = parseInt(argv[i], 10) || 50;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--retries=')) {
+      retries = parseInt(arg.slice('--retries='.length), 10) || 50;
+      i++;
+      continue;
+    }
+
+    if (arg === '--base-delay-ms') {
+      i++;
+      if (i < argv.length) baseDelayMs = parseInt(argv[i], 10) || 100;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--base-delay-ms=')) {
+      baseDelayMs = parseInt(arg.slice('--base-delay-ms='.length), 10) || 100;
+      i++;
+      continue;
+    }
+
+    if (arg === '--cap-delay-ms') {
+      i++;
+      if (i < argv.length) capDelayMs = parseInt(argv[i], 10) || 5000;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--cap-delay-ms=')) {
+      capDelayMs = parseInt(arg.slice('--cap-delay-ms='.length), 10) || 5000;
+      i++;
+      continue;
+    }
+
+    if (!arg.startsWith('-') && !file) {
+      file = arg;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (!file) {
+    console.error('ddlforge run: Missing migration SQL file argument.');
+    return 1;
+  }
+
+  const resolvedPath = path.resolve(process.cwd(), file);
+  if (!fs.existsSync(resolvedPath)) {
+    console.error(`ddlforge run: Migration file not found: ${file}`);
+    return 1;
+  }
+
+  if (!dbUrl) {
+    console.error('ddlforge run: Missing required database connection URL (--db or DATABASE_URL).');
+    return 1;
+  }
+
+  const ddlSql = fs.readFileSync(resolvedPath, 'utf-8');
+
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: dbUrl });
+
+  try {
+    const { MigrationCircuitBreaker } = await import('./cluster/circuitBreaker.js');
+    const breaker = new MigrationCircuitBreaker({
+      maxQueueDepth,
+      maxQueueWaitMs,
+    });
+
+    breaker.on('tripped', (evt) => {
+      console.warn(`[ddlforge circuit breaker] Pre-emptively canceled DDL (PID ${evt.executorPid}) - ${evt.queueDepth} queries blocked, max wait ${evt.maxWaitMs}ms (attempt ${evt.attempt})`);
+    });
+
+    breaker.on('retry', (evt) => {
+      console.log(`[ddlforge circuit breaker] Retrying in ${evt.sleepMs}ms (attempt ${evt.attempt}, reason: ${evt.reason})...`);
+    });
+
+    breaker.on('success', (evt) => {
+      console.log(`✔ Migration executed successfully in ${evt.durationMs}ms (${evt.attempts} attempt${evt.attempts > 1 ? 's' : ''})`);
+    });
+
+    const result = await breaker.executeWithPreemption(pool, ddlSql, {
+      maxRetries: retries,
+      baseDelayMs,
+      capDelayMs,
+    });
+
+    return result.success ? 0 : 1;
+  } catch (err: any) {
+    console.error(`ddlforge run: Migration execution failed: ${err.message}`);
+    return 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
+/**
+ * Executes the `ddlforge top` subcommand.
+ */
+export async function runTop(argv: string[]): Promise<number> {
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let format: 'terminal' | 'json' = 'terminal';
+  let watch = false;
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge top --db <url> [options]
+
+Real-time lock contention & deadlock graph visualizer.
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (defaults to DATABASE_URL)
+  --format <type>     Output format: terminal | json (default: terminal)
+  --watch             Continuously refresh lock contention graph every 1s
+  --help, -h          Print this help message and exit
+`);
+      return 0;
+    }
+    if (arg === '--watch') {
+      watch = true;
+      i++;
+      continue;
+    }
+    if (arg === '--db') {
+      i++;
+      if (i < argv.length) dbUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      dbUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+    if (arg === '--format') {
+      i++;
+      if (i < argv.length) {
+        const f = argv[i].toLowerCase();
+        if (f === 'json' || f === 'terminal') format = f;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length).toLowerCase();
+      if (f === 'json' || f === 'terminal') format = f;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  if (!dbUrl) {
+    console.error('ddlforge top: Missing required database connection URL (--db or DATABASE_URL).');
+    return 1;
+  }
+
+  const { Client } = await import('pg');
+  const client = new Client({ connectionString: dbUrl });
+  await client.connect();
+
+  try {
+    const { fetchLiveDeadlockGraph, formatDeadlockGraphTerminal, formatDeadlockGraphJson } = await import('./cluster/deadlockGraph.js');
+
+    const printOnce = async () => {
+      const graph = await fetchLiveDeadlockGraph(client);
+      if (format === 'json') {
+        console.log(formatDeadlockGraphJson(graph));
+      } else {
+        console.log(formatDeadlockGraphTerminal(graph));
+      }
+    };
+
+    if (!watch) {
+      await printOnce();
+      return 0;
+    }
+
+    // Watch mode: loop every 1000ms until SIGINT / process exit
+    while (true) {
+      if (format === 'terminal') {
+        // Clear terminal screen
+        process.stdout.write('\x1b[2J\x1b[0;0H');
+      }
+      await printOnce();
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+

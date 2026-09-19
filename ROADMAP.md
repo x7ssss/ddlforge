@@ -101,3 +101,25 @@
 - `test/masking/backfill.test.ts`: Keyset pagination, SKIP LOCKED, lock timeout backoff, loop commits, constraint deferral.
 - `test/masking/advisor.test.ts`: Fillfactor HOT update recommendations, telemetry shielding, referential integrity verification queries, formatters.
 - `test/masking/cli.test.ts`: CLI unit tests for trigger, backfill, advice subcommands and input validation.
+
+---
+
+## ✅ v1.3.0: Autonomous Lock Pre-emption, DDL Circuit Breaking & Deadlock Visualizer (COMPLETED)
+
+### 1. Autonomous DDL Circuit Breaker (`src/cluster/circuitBreaker.ts`)
+- **Dual-Connection Sniffer & Executor Architecture**: Executes migration DDL on an isolated executor backend while a secondary sniffer backend continuously polls `pg_stat_activity` and `pg_blocking_pids()` every 50ms.
+- **Pre-emptive Lock Cancellation**: If the DDL causes > `maxQueueDepth` (default: 5) blocked queries or wait time exceeds `maxQueueWaitMs` (default: 200ms), the sniffer immediately issues `SELECT pg_cancel_backend(executorPid)` (SIGINT / SQLSTATE 57014), releasing locks and yielding immediately to OLTP transactions without severing connections.
+- **Decorrelated Jitter Backoff Loop**: Catches SQLSTATE `55P03` (`lock_not_available`) and `57014` (`query_canceled`), calculating non-deterministic backoff delays via `calculateDecorrelatedJitter(baseMs, capMs, prevSleepMs)` bounded strictly within `[baseMs, capMs]` to eliminate lock convoys across poolers (PgBouncer).
+- CLI command: `ddlforge run <file.sql> --db <url> [--max-queue <n>] [--max-wait-ms <n>] [--retries <n>] [--base-delay-ms <n>] [--cap-delay-ms <n>]`.
+
+### 2. Live Lock Contention & Deadlock Visualizer (`src/cluster/deadlockGraph.ts`)
+- **Real-Time Graph Traversal**: Queries `pg_stat_activity` and `pg_locks` to construct a directed wait-for graph (`waiterPid ──> blockerPid`).
+- **DFS Cycle Detection**: Depth-first search with path tracking detects circular wait cycles, correctly classifying states as `DEADLOCK_CYCLE` (SQLSTATE 40P01), `LINEAR_LOCK_CHAIN`, or `CLEAN`.
+- **Root Blocker Identification**: Computes PIDs with incoming wait edges but 0 outgoing wait edges (holding locks without being blocked), providing precise `pg_cancel_backend(rootPid)` remediation commands.
+- **Rich Terminal & JSON Formatters**: Colorized terminal output with badges (`[ROOT BLOCKER]`, `[HOLDER]`, `[WAITING]`) and structured JSON output for observability pipelines.
+- CLI command: `ddlforge top --db <url> [--watch] [--format terminal|json]`.
+
+### 3. Test Suite
+- `test/cluster/circuitBreaker.test.ts`: Decorrelated jitter bounds verification across 500 iterations, non-deterministic variation, error classification (55P03, 57014, text indicators), event emission (`tripped`, `retry`, `success`), mock pool lifecycle.
+- `test/cluster/deadlockGraph.test.ts`: 2-node reciprocal cycle, 3-node circular wait, linear wait chain, clean graph, root blocker calculation, terminal and JSON formatters.
+- `test/cluster/cli.test.ts`: CLI help flags, missing argument error reporting, environment variable fallbacks, and dispatch routing for `ddlforge run` and `ddlforge top`.
