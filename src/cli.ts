@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.7.0';
+export const VERSION = '1.8.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -175,6 +175,41 @@ USAGE:
   ddlforge doctor [options]                # continuous WAL archival health & disaster recovery readiness
   ddlforge verify-backup [options]         # verify restored instance health, recovery state & amcheck
   ddlforge compact <estimate|table|index>  # zero-downtime table compaction & bloat estimator
+  ddlforge tenant <migrate|audit|sweep>    # multi-tenant distribution & drift auditing
+
+── TENANT (multi-tenant distribution & drift auditing) ─────────
+  ddlforge tenant migrate [options]
+  ddlforge tenant audit [options]
+  ddlforge tenant sweep [options]
+
+SUBCOMMANDS:
+  migrate             Distribute DDL migration across multi-tenant fleet (schema or database)
+  audit               Audit cross-tenant schema drift and generate zero-downtime reconciliation SQL
+  sweep               Self-healing sweeper for stale/orphaned distributed DDL runs
+
+MIGRATE FLAGS:
+  --strategy <type>   Multi-tenant topology: schema | database (default: schema)
+  --pattern <glob>    Schema name pattern for schema-per-tenant (default: tenant_*)
+  --file <path>       Migration SQL file to execute across tenants
+  --concurrency <n>   Concurrent worker pool limit (default: 8)
+  --rate-limit <n>    Maximum tenant operations per second
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --config <path>     JSON config file for database-per-tenant strategy
+  --format <type>     Output format: terminal | json (default: terminal)
+
+AUDIT FLAGS:
+  --strategy <type>   Multi-tenant topology: schema | database (default: schema)
+  --pattern <glob>    Schema name pattern for schema-per-tenant (default: tenant_*)
+  --golden <name>     Reference golden tenant/schema (default: auto-detected by consensus)
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --format <type>     Output format: terminal | json (default: terminal)
+
+SWEEP FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --max-age-minutes <n> Age threshold in minutes for stale PREPARED runs (default: 30)
+  --auto-heal         Automatically heal stale runs if fleet consensus succeeded (default: true)
+  --dry-run           Preview sweep decisions without updating ledger table
+  --format <type>     Output format: terminal | json (default: terminal)
 
 ── COMPACT (zero-downtime table compaction & bloat estimator) ──────
   ddlforge compact estimate [options]
@@ -774,6 +809,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect compact subcommand (zero-downtime table compaction & bloat estimator)
   if (argv[0] === 'compact') {
     return runCompact(argv.slice(1));
+  }
+
+  // Detect tenant subcommand (multi-tenant distribution, state machine & drift auditing)
+  if (argv[0] === 'tenant') {
+    return runTenant(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -4147,6 +4187,577 @@ FLAGS:
   }
 
   console.error(`ddlforge compact: Unknown subcommand "${sub}". Supported subcommands: estimate, table, index.`);
+  return 1;
+}
+
+/**
+ * Executes the `ddlforge tenant` subcommand.
+ */
+export async function runTenant(argv: string[]): Promise<number> {
+  const sub = argv[0];
+
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge tenant <subcommand> [options]
+
+Multi-tenant schema distribution, distributed DDL state machine, and cross-tenant drift auditing.
+
+SUBCOMMANDS:
+  migrate             Distribute DDL migration across multi-tenant fleet (schema or database)
+  audit               Audit cross-tenant schema drift and generate zero-downtime reconciliation SQL
+  sweep               Self-healing sweeper for stale/orphaned distributed DDL runs
+
+EXAMPLES:
+  $ ddlforge tenant migrate --strategy schema --pattern "tenant_*" --file migration.sql --concurrency 8
+  $ ddlforge tenant audit --strategy schema --pattern "tenant_*" --golden tenant_001
+  $ ddlforge tenant sweep --max-age-minutes 30
+`);
+    return 0;
+  }
+
+  // Subcommand 1: ddlforge tenant migrate
+  if (sub === 'migrate') {
+    const subArgs = argv.slice(1);
+    let strategy: 'schema' | 'database' = 'schema';
+    let pattern = 'tenant_*';
+    let file = '';
+    let concurrency = 8;
+    let rateLimit: number | undefined;
+    let throttleMs = 0;
+    let stopOnError = false;
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let configFile = '';
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge tenant migrate [options]
+
+Distribute DDL migration across multi-tenant fleet with bounded worker pool and distributed state tracking.
+
+FLAGS:
+  --strategy <type>   Multi-tenant topology: schema | database (default: schema)
+  --pattern <glob>    Schema name pattern for schema-per-tenant (default: tenant_*)
+  --file <path>       Migration SQL file to execute across tenants (optional for discovery-only)
+  --concurrency <n>   Concurrent worker pool limit (default: 8)
+  --rate-limit <n>    Maximum tenant operations per second
+  --throttle-ms <n>   Delay in ms between initiating tenant tasks (default: 0)
+  --stop-on-error     Halt execution immediately on first tenant failure
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --config <path>     JSON config file for database-per-tenant strategy
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--strategy') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'schema' || subArgs[i] === 'database')) strategy = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--strategy=')) {
+        const s = arg.slice('--strategy='.length);
+        if (s === 'schema' || s === 'database') strategy = s as any;
+        i++;
+        continue;
+      }
+      if (arg === '--pattern') {
+        i++;
+        if (i < subArgs.length) pattern = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--pattern=')) {
+        pattern = arg.slice('--pattern='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--file') {
+        i++;
+        if (i < subArgs.length) file = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--file=')) {
+        file = arg.slice('--file='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--concurrency') {
+        i++;
+        if (i < subArgs.length) concurrency = parseInt(subArgs[i], 10) || 8;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--concurrency=')) {
+        concurrency = parseInt(arg.slice('--concurrency='.length), 10) || 8;
+        i++;
+        continue;
+      }
+      if (arg === '--rate-limit') {
+        i++;
+        if (i < subArgs.length) rateLimit = parseInt(subArgs[i], 10) || undefined;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--rate-limit=')) {
+        rateLimit = parseInt(arg.slice('--rate-limit='.length), 10) || undefined;
+        i++;
+        continue;
+      }
+      if (arg === '--throttle-ms') {
+        i++;
+        if (i < subArgs.length) throttleMs = parseInt(subArgs[i], 10) || 0;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--throttle-ms=')) {
+        throttleMs = parseInt(arg.slice('--throttle-ms='.length), 10) || 0;
+        i++;
+        continue;
+      }
+      if (arg === '--stop-on-error') {
+        stopOnError = true;
+        i++;
+        continue;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--config') {
+        i++;
+        if (i < subArgs.length) configFile = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--config=')) {
+        configFile = arg.slice('--config='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (strategy === 'schema' && !dbUrl) {
+      console.error('ddlforge tenant migrate: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    if (strategy === 'database' && !configFile && !dbUrl) {
+      console.error('ddlforge tenant migrate: For database-per-tenant, --config <file> or --db <url> must be provided.');
+      return 1;
+    }
+
+    let sqlContent = '';
+    if (file) {
+      if (!fs.existsSync(file)) {
+        console.error(`ddlforge tenant migrate: Migration file "${file}" not found.`);
+        return 1;
+      }
+      sqlContent = fs.readFileSync(file, 'utf-8');
+    }
+
+    const { Pool } = await import('pg');
+    const pool = dbUrl ? new Pool({ connectionString: dbUrl }) : null;
+
+    try {
+      const {
+        discoverTenants,
+        executeWorkerPool,
+        formatExecutionSummaryTerminal,
+        prepareDistributedRun,
+        commitDistributedRun,
+        abortDistributedRun,
+      } = await import('./distributed/index.js');
+
+      const targets = await discoverTenants(pool, {
+        strategy,
+        pattern,
+        configFile: configFile || undefined,
+      });
+
+      if (targets.length === 0) {
+        console.log(`[ddlforge tenant] No tenants discovered matching pattern "${pattern}".`);
+        return 0;
+      }
+
+      if (!sqlContent) {
+        // Discovery-only run
+        if (format === 'json') {
+          console.log(JSON.stringify({ strategy, pattern, total: targets.length, tenants: targets }, null, 2));
+        } else {
+          console.log(`[ddlforge tenant] Discovered ${targets.length} tenant(s) for strategy "${strategy}":`);
+          for (const t of targets) {
+            console.log(`  • ${t.name} (strategy: ${t.strategy}, schema: ${t.schema || 'N/A'})`);
+          }
+        }
+        return 0;
+      }
+
+      // Execute migration with two-phase coordinator tracking
+      const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const migrationVersion = path.basename(file);
+
+      const summary = await executeWorkerPool(
+        targets,
+        async (target) => {
+          const targetPool = target.connectionUrl ? new Pool({ connectionString: target.connectionUrl }) : pool!;
+          const shouldCloseTargetPool = Boolean(target.connectionUrl);
+
+          try {
+            // 1. Prepare intent in state ledger
+            if (pool) {
+              await prepareDistributedRun(pool, {
+                runId,
+                migrationVersion,
+                nodeId: target.id,
+                ddlStatement: sqlContent,
+              });
+            }
+
+            // 2. Execute DDL in tenant context
+            const client = await targetPool.connect();
+            try {
+              if (target.schema) {
+                await client.query(`SET LOCAL search_path = "${target.schema.replace(/"/g, '""')}", public;`);
+              }
+              await client.query(`SET LOCAL lock_timeout = '2s';`);
+              await client.query(sqlContent);
+            } finally {
+              client.release();
+            }
+
+            // 3. Commit intent in state ledger
+            if (pool) {
+              await commitDistributedRun(pool, {
+                runId,
+                nodeId: target.id,
+              });
+            }
+            return { committed: true };
+          } catch (err: any) {
+            if (pool) {
+              await abortDistributedRun(pool, {
+                runId,
+                nodeId: target.id,
+                error: err?.message ?? String(err),
+              }).catch(() => {});
+            }
+            throw err;
+          } finally {
+            if (shouldCloseTargetPool) {
+              await targetPool.end().catch(() => {});
+            }
+          }
+        },
+        {
+          concurrency,
+          rateLimitPerSec: rateLimit,
+          throttleMs,
+          stopOnError,
+        }
+      );
+
+      if (format === 'json') {
+        console.log(JSON.stringify(summary, null, 2));
+      } else {
+        console.log(formatExecutionSummaryTerminal(summary));
+      }
+
+      return summary.failed > 0 ? 1 : 0;
+    } catch (err: any) {
+      console.error(`ddlforge tenant migrate error: ${err.message}`);
+      return 1;
+    } finally {
+      if (pool) await pool.end().catch(() => {});
+    }
+  }
+
+  // Subcommand 2: ddlforge tenant audit
+  if (sub === 'audit') {
+    const subArgs = argv.slice(1);
+    let strategy: 'schema' | 'database' = 'schema';
+    let pattern = 'tenant_*';
+    let goldenTenant = '';
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let configFile = '';
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge tenant audit [options]
+
+Audit cross-tenant schema drift and generate zero-downtime reconciliation SQL.
+
+FLAGS:
+  --strategy <type>   Multi-tenant topology: schema | database (default: schema)
+  --pattern <glob>    Schema name pattern for schema-per-tenant (default: tenant_*)
+  --golden <name>     Reference golden tenant/schema (default: auto-detected by consensus)
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --config <path>     JSON config file for database-per-tenant strategy
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--strategy') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'schema' || subArgs[i] === 'database')) strategy = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--strategy=')) {
+        const s = arg.slice('--strategy='.length);
+        if (s === 'schema' || s === 'database') strategy = s as any;
+        i++;
+        continue;
+      }
+      if (arg === '--pattern') {
+        i++;
+        if (i < subArgs.length) pattern = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--pattern=')) {
+        pattern = arg.slice('--pattern='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--golden') {
+        i++;
+        if (i < subArgs.length) goldenTenant = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--golden=')) {
+        goldenTenant = arg.slice('--golden='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--config') {
+        i++;
+        if (i < subArgs.length) configFile = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--config=')) {
+        configFile = arg.slice('--config='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl && strategy === 'schema') {
+      console.error('ddlforge tenant audit: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = dbUrl ? new Pool({ connectionString: dbUrl }) : null;
+
+    try {
+      const {
+        discoverTenants,
+        introspectTenantSchemas,
+        evaluateFleetDrift,
+        formatDriftReportTerminal,
+      } = await import('./distributed/index.js');
+
+      const targets = await discoverTenants(pool, {
+        strategy,
+        pattern,
+        configFile: configFile || undefined,
+      });
+
+      if (targets.length === 0) {
+        console.log(`[ddlforge tenant audit] No tenants discovered matching pattern "${pattern}".`);
+        return 0;
+      }
+
+      const tenantSchemas = await introspectTenantSchemas(pool!, targets);
+      const report = evaluateFleetDrift(tenantSchemas, {
+        goldenTenant: goldenTenant || undefined,
+      });
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatDriftReportTerminal(report));
+      }
+
+      return report.driftedCount > 0 ? 1 : 0;
+    } catch (err: any) {
+      console.error(`ddlforge tenant audit error: ${err.message}`);
+      return 1;
+    } finally {
+      if (pool) await pool.end().catch(() => {});
+    }
+  }
+
+  // Subcommand 3: ddlforge tenant sweep
+  if (sub === 'sweep') {
+    const subArgs = argv.slice(1);
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let maxAgeMinutes = 30;
+    let autoHeal = true;
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge tenant sweep [options]
+
+Self-healing orphan sweeper for stale/abandoned distributed DDL runs.
+
+FLAGS:
+  --db <url>              PostgreSQL connection URL (or DATABASE_URL)
+  --max-age-minutes <n>   Age threshold in minutes for stale PREPARED runs (default: 30)
+  --auto-heal             Automatically heal stale runs if fleet consensus succeeded (default: true)
+  --no-auto-heal          Disable automated healing
+  --dry-run               Preview sweep decisions without updating ledger table
+  --format <type>         Output format: terminal | json (default: terminal)
+  --help, -h              Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--max-age-minutes') {
+        i++;
+        if (i < subArgs.length) maxAgeMinutes = parseInt(subArgs[i], 10) || 30;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--max-age-minutes=')) {
+        maxAgeMinutes = parseInt(arg.slice('--max-age-minutes='.length), 10) || 30;
+        i++;
+        continue;
+      }
+      if (arg === '--auto-heal') {
+        autoHeal = true;
+        i++;
+        continue;
+      }
+      if (arg === '--no-auto-heal') {
+        autoHeal = false;
+        i++;
+        continue;
+      }
+      if (arg === '--dry-run') {
+        dryRun = true;
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl) {
+      console.error('ddlforge tenant sweep: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { sweepDistributedRuns, formatSweepReportTerminal } = await import('./distributed/index.js');
+      const report = await sweepDistributedRuns(pool, {
+        maxAgeMinutes,
+        autoHeal,
+        dryRun,
+      });
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSweepReportTerminal(report));
+      }
+
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge tenant sweep error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  console.error(`ddlforge tenant: Unknown subcommand "${sub}". Supported subcommands: migrate, audit, sweep.`);
   return 1;
 }
 

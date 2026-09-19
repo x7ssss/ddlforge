@@ -273,4 +273,45 @@
 - `test/compaction/repack.test.ts`: Unit tests for 5-phase SQL generator, keyset bulk copy procedure, JSONB replay rehydration, trigger depth guard, bounded cutover timeouts, and parity check assertions.
 - `test/compaction/reindex.test.ts`: Unit tests for concurrent index reindex syntax, table reindex syntax, and autocommit transaction context validation.
 - `test/compaction/cli.test.ts`: Unit tests for `ddlforge compact` CLI routing, `estimate`, `table`, and `index` subcommands, help screens, error handling, and JSON output formatting.
+
+---
+
+## ✅ v1.8.0: Multi-Tenant Schema Distribution, Distributed DDL State Machine, and Cross-Tenant Schema Drift Auditing (COMPLETED)
+
+### 1. Multi-Tenant Topology Router & Discovery (`src/distributed/tenantRouter.ts`)
+- **Dual Multi-Tenant Strategies**:
+  - `schema-per-tenant`: Discovers isolated namespaces via `pg_namespace` filtered with glob patterns (`--pattern <glob>`, e.g. `tenant_*`), skipping internal system namespaces (`pg_*`, `information_schema`, `ddlforge`).
+  - `database-per-tenant`: Discovers physical database targets via JSON configuration files (`--config <path>`) or programmatic in-memory connection maps.
+- **Glob Matching**: Deterministic translation of glob expressions (`*`, `?`) to regex with safe character escaping.
+- **CLI Subcommand**: `ddlforge tenant migrate --strategy <schema|database> [options]`.
+
+### 2. High-Throughput Worker Pool (`src/distributed/workerPool.ts`)
+- **Bounded Concurrency Orchestrator**: Executes distributed migration tasks across tenant fleets with configurable concurrency limit (default: 8).
+- **Pacing & Rate Limiting**: Enforces rate limiting (`--rate-limit <n>` ops/sec) and throttling delays (`--throttle-ms <n>`) to eliminate catalog lock convoys and sinval buffer saturation.
+- **Failure Boundary Isolation**: Isolates individual tenant errors (`status: 'FAILED'`), preserving fleet progress unless explicit `--stop-on-error` is specified (`status: 'SKIPPED'`).
+- **Comprehensive Telemetry**: Real-time progress updates and formatted execution summaries displaying tenant name, strategy, duration, status, and error details.
+
+### 3. Distributed DDL Coordinator & State Ledger (`src/distributed/twoPhaseCoordinator.ts`)
+- **Engine Invariant**: Overcomes PostgreSQL's native restriction on DDL inside `PREPARE TRANSACTION` (SQLSTATE 0A000) and autocommit requirements for concurrent DDL by implementing an application-level Distributed Transaction Coordinator.
+- **Durable State Ledger**: Manages `ddlforge.ddlforge_distributed_run` tracking `(run_id, migration_version, node_id, phase, prepared_at, committed_at, gid, ddl_statement, checksum, retry_count, last_error)`.
+- **State Machine**: Transitions from `PREPARED` (with normalized SHA-256 SQL checksum) to `COMMITTED`, `ABORTED`, or `HEALED`.
+- **Self-Healing Orphan Sweeper**: Queries stale `PREPARED` runs older than `--max-age-minutes` (default: 30m). Automatically heals nodes (`HEALED`) if fleet majority consensus succeeded, or aborts (`ABORTED`) if consensus failed.
+- **CLI Subcommand**: `ddlforge tenant sweep [--max-age-minutes <n>] [--auto-heal] [--dry-run]`.
+
+### 4. Cross-Tenant Schema Drift Auditor (`src/distributed/driftAuditor.ts`)
+- **Deterministic Schema Fingerprinting**: Computes canonical SHA-256 fingerprint from normalized catalog definitions (columns, format_type, constraints via `pg_get_expr`, and normalized index definitions).
+- **Consensus Golden Schema Identification**: Automatically identifies reference schema via majority consensus (or explicit `--golden <tenant>`), grouping fleets into fingerprint clusters.
+- **Drifted Snowflake Detection**: Flags non-matching tenants and calculates exact missing columns, indexes, constraints, and extra objects.
+- **Zero-Downtime Reconciliation Patching**:
+  - Missing indexes: `CREATE INDEX CONCURRENTLY`
+  - Missing constraints: `ALTER TABLE ... ADD CONSTRAINT ... NOT VALID` followed by `ALTER TABLE ... VALIDATE CONSTRAINT`
+  - Missing columns: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+- **CLI Subcommand**: `ddlforge tenant audit [--strategy <schema|database>] [--pattern <glob>] [--golden <name>] [--format terminal|json]`.
+
+### 5. Test Suite
+- `test/distributed/tenantRouter.test.ts`: Unit tests for glob matching, regex generation, system schema exclusion, schema-per-tenant catalog discovery, and database-per-tenant config parsing.
+- `test/distributed/workerPool.test.ts`: Unit tests for worker pool concurrency bounds, pacing, failure isolation, abort-on-error, and progress reporting.
+- `test/distributed/twoPhaseCoordinator.test.ts`: Unit tests for DDL normalization, SHA-256 checksumming, state ledger transitions, consensus-based orphan healing, and sweep reporting.
+- `test/distributed/driftAuditor.test.ts`: Unit tests for canonical schema fingerprint hashing, golden schema determination, diff calculation, and zero-downtime reconciliation SQL generation.
+- `test/distributed/cli.test.ts`: Unit tests for `ddlforge tenant` CLI routing, `migrate`, `audit`, `sweep` subcommands, help screens, error handling, and JSON formatting.
 

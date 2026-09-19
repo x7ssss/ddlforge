@@ -49,3 +49,6 @@ export * from './recovery/index.js';
 
 // Compaction (Zero-Downtime Table Compaction & Online Repack Engine)
 export * from './compaction/index.js';
+
+// Distributed (Multi-Tenant Distribution, Distributed DDL State Machine & Drift Auditing)
+export * from './distributed/index.js';
