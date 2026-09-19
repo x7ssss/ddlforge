@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.5.0';
+export const VERSION = '1.6.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -172,6 +172,27 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+  ddlforge doctor [options]                # continuous WAL archival health & disaster recovery readiness
+  ddlforge verify-backup [options]         # verify restored instance health, recovery state & amcheck
+
+── DOCTOR (continuous WAL archiving & disaster recovery) ───────────
+  ddlforge doctor [options]
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL env var)
+  --stale-minutes <n> Archive staleness threshold in minutes (default: 15)
+  --max-lag-mb <n>    Standby replay lag threshold in MB (default: 100)
+  --format <type>     Output format: terminal | json (default: terminal)
+
+── VERIFY-BACKUP (restore validation & amcheck integrity) ──────────
+  ddlforge verify-backup [options]
+
+FLAGS:
+  --target-url <url>  Target restored PostgreSQL URL (or DATABASE_URL env var)
+  --db <url>          Alias for --target-url
+  --rpo-hours <n>     Maximum acceptable RPO threshold in hours (default: 24)
+  --skip-amcheck      Skip B-Tree index corruption checks via amcheck
+  --format <type>     Output format: terminal | json (default: terminal)
 
 ── PREFLIGHT (disk capacity, blast radius & WAL forecasting) ───────────
   ddlforge preflight <file.sql> [options]
@@ -708,6 +729,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect top subcommand (deadlock & contention visualizer)
   if (argv[0] === 'top') {
     return runTop(argv.slice(1));
+  }
+
+  // Detect doctor subcommand (continuous WAL archival health & disaster recovery readiness)
+  if (argv[0] === 'doctor') {
+    return runDoctor(argv.slice(1));
+  }
+
+  // Detect verify-backup subcommand (restored instance verification & amcheck)
+  if (argv[0] === 'verify-backup') {
+    return runVerifyBackup(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -1772,6 +1803,10 @@ export async function runCircuitBreaker(argv: string[]): Promise<number> {
   let retries = 50;
   let baseDelayMs = 100;
   let capDelayMs = 5000;
+  let forceNoBackup = false;
+  let rpoHours = 24;
+  let backupProvider = 'catalog';
+  let skipDrGuard = false;
 
   let i = 0;
   while (i < argv.length) {
@@ -1793,6 +1828,10 @@ FLAGS:
   --retries <n>       Maximum retry attempts with decorrelated jitter (default: 50)
   --base-delay-ms <n> Initial base delay in ms for backoff (default: 100)
   --cap-delay-ms <n>  Maximum delay cap in ms for backoff (default: 5000)
+  --force-no-backup   Bypass disaster recovery and backup RPO safety guard
+  --rpo-hours <n>     Maximum acceptable backup age in hours (default: 24)
+  --backup-provider <p> Backup auditor provider: catalog | pgbackrest | mock (default: catalog)
+  --skip-dr-guard     Skip continuous archiving and replication slot checks
   --help, -h          Print this help message and exit
 `);
       return 0;
@@ -1870,6 +1909,42 @@ FLAGS:
       continue;
     }
 
+    if (arg === '--force-no-backup') {
+      forceNoBackup = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--rpo-hours') {
+      i++;
+      if (i < argv.length) rpoHours = parseInt(argv[i], 10) || 24;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--rpo-hours=')) {
+      rpoHours = parseInt(arg.slice('--rpo-hours='.length), 10) || 24;
+      i++;
+      continue;
+    }
+
+    if (arg === '--backup-provider') {
+      i++;
+      if (i < argv.length) backupProvider = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--backup-provider=')) {
+      backupProvider = arg.slice('--backup-provider='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--skip-dr-guard') {
+      skipDrGuard = true;
+      i++;
+      continue;
+    }
+
     if (!arg.startsWith('-') && !file) {
       file = arg;
       i++;
@@ -1901,11 +1976,92 @@ FLAGS:
   const pool = new Pool({ connectionString: dbUrl });
 
   try {
+    // Disaster Recovery & Backup RPO Safety Guard for high-risk migrations
+    const { detectHighRiskOperations, auditDisasterReadiness, auditBackupRpo, recordSafetyLog } =
+      await import('./recovery/index.js');
+    const risk = detectHighRiskOperations(ddlSql);
+
+    if (risk.isHighRisk && !skipDrGuard) {
+      let disasterReport: any = null;
+      let backupReport: any = null;
+
+      try {
+        disasterReport = await auditDisasterReadiness(pool);
+      } catch (err: any) {
+        console.warn(`[ddlforge run] Warning: Disaster readiness query notice: ${err.message}`);
+      }
+
+      try {
+        backupReport = await auditBackupRpo(backupProvider as any, pool, { rpoHours });
+      } catch (err: any) {
+        console.warn(`[ddlforge run] Warning: Backup RPO audit notice: ${err.message}`);
+      }
+
+      const isArchiverFailing = disasterReport?.archiver?.status === 'FAILING_NOW';
+      const isRpoViolated = backupReport && !backupReport.isCompliant;
+
+      if ((isArchiverFailing || isRpoViolated) && !forceNoBackup) {
+        await recordSafetyLog(pool, {
+          eventType: 'migration_preflight',
+          targetIdentifier: dbUrl.replace(/:[^:@]+@/, ':***@'),
+          status: 'FAILED',
+          details: {
+            file,
+            reasons: risk.reasons,
+            archiverStatus: disasterReport?.archiver?.status,
+            rpoCompliant: backupReport?.isCompliant,
+            violationReason: backupReport?.violationReason,
+          },
+        });
+
+        console.error(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✖ HIGH-RISK MIGRATION BLOCKED: DISASTER RECOVERY & RPO SAFETY GUARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Detected destructive/irreversible DDL operations in ${file}:
+${risk.reasons.map((r: string) => `  - ${r}`).join('\n')}
+
+SAFETY VIOLATIONS:`);
+
+        if (isArchiverFailing) {
+          console.error(`  - FAILING WAL ARCHIVE: pg_stat_archiver shows active archive failures. Point-in-time recovery is broken.`);
+        }
+        if (isRpoViolated) {
+          console.error(`  - RPO THRESHOLD EXCEEDED: ${backupReport?.violationReason ?? `Backup older than ${rpoHours}h limit.`}`);
+        }
+
+        console.error(`
+DIAGNOSTIC & REMEDIATION STEPS:
+  1. Inspect PostgreSQL WAL archiving: SELECT * FROM pg_stat_archiver;
+  2. Verify or trigger a fresh backup before executing destructive migrations.
+  3. Run 'ddlforge doctor --db <url>' to check cluster recovery readiness.
+  4. To bypass this guard for testing or emergency maintenance, pass --force-no-backup.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`);
+        return 1;
+      }
+
+      if (disasterReport || backupReport) {
+        await recordSafetyLog(pool, {
+          eventType: 'migration_preflight',
+          targetIdentifier: dbUrl.replace(/:[^:@]+@/, ':***@'),
+          status: 'PASSED',
+          details: {
+            file,
+            reasons: risk.reasons,
+            archiverStatus: disasterReport?.archiver?.status,
+            rpoCompliant: backupReport?.isCompliant,
+          },
+        });
+      }
+    }
+
     const { MigrationCircuitBreaker } = await import('./cluster/circuitBreaker.js');
     const breaker = new MigrationCircuitBreaker({
       maxQueueDepth,
       maxQueueWaitMs,
     });
+
 
     breaker.on('tripped', (evt) => {
       console.warn(`[ddlforge circuit breaker] Pre-emptively canceled DDL (PID ${evt.executorPid}) - ${evt.queueDepth} queries blocked, max wait ${evt.maxWaitMs}ms (attempt ${evt.attempt})`);
@@ -2642,6 +2798,10 @@ export async function runPreflight(argv: string[]): Promise<number> {
   let maxLagSec = 10;
   let schema = 'public';
   let format: 'terminal' | 'json' = 'terminal';
+  let forceNoBackup = false;
+  let rpoHours = 24;
+  let backupProvider = 'catalog';
+  let skipDrGuard = false;
 
   let i = 0;
   while (i < argv.length) {
@@ -2667,6 +2827,10 @@ FLAGS:
   --tuples <n>             Live + dead tuple count (for static/simulation runs)
   --max-lag-mb <n>         Maximum acceptable replica lag in MB (default: 100)
   --max-lag-sec <n>        Maximum acceptable replica lag in seconds (default: 10)
+  --force-no-backup        Bypass disaster recovery and backup RPO safety guard
+  --rpo-hours <n>          Maximum acceptable backup age in hours (default: 24)
+  --backup-provider <type> Backup provider: catalog | pgbackrest | mock (default: catalog)
+  --skip-dr-guard          Skip continuous archiving and replication slot checks
   --schema <name>          Database schema (default: public)
   --format <type>          Output format: terminal | json (default: terminal)
   --help, -h               Print this help message and exit
@@ -2825,6 +2989,42 @@ FLAGS:
       continue;
     }
 
+    if (arg === '--force-no-backup') {
+      forceNoBackup = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--rpo-hours') {
+      i++;
+      if (i < argv.length) rpoHours = parseInt(argv[i], 10) || 24;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--rpo-hours=')) {
+      rpoHours = parseInt(arg.slice('--rpo-hours='.length), 10) || 24;
+      i++;
+      continue;
+    }
+
+    if (arg === '--backup-provider') {
+      i++;
+      if (i < argv.length) backupProvider = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--backup-provider=')) {
+      backupProvider = arg.slice('--backup-provider='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--skip-dr-guard') {
+      skipDrGuard = true;
+      i++;
+      continue;
+    }
+
     if (!arg.startsWith('-') && !file) {
       file = arg;
       i++;
@@ -2906,6 +3106,60 @@ FLAGS:
 
       const configReport = await auditClusterConfig(pool);
 
+      const { auditDisasterReadiness, auditBackupRpo, detectHighRiskOperations } = await import('./recovery/index.js');
+      let disasterReport: any = null;
+      try {
+        disasterReport = await auditDisasterReadiness(pool);
+      } catch (err: any) {
+        console.warn(`[ddlforge preflight] Disaster readiness query notice: ${err.message}`);
+      }
+
+      let backupReport: any = null;
+      try {
+        backupReport = await auditBackupRpo(backupProvider as any, pool, { rpoHours });
+      } catch (err: any) {
+        console.warn(`[ddlforge preflight] Backup RPO query notice: ${err.message}`);
+      }
+
+      let highRiskAudit: { isHighRisk: boolean; reasons: string[] } = { isHighRisk: false, reasons: [] };
+      if (file) {
+        const resolved = path.resolve(process.cwd(), file);
+        if (fs.existsSync(resolved)) {
+          const sqlContent = fs.readFileSync(resolved, 'utf-8');
+          highRiskAudit = detectHighRiskOperations(sqlContent);
+        }
+      }
+
+      const isArchiverFailing = disasterReport?.archiver?.status === 'FAILING_NOW';
+      const isRpoViolated = backupReport && !backupReport.isCompliant;
+
+      if (highRiskAudit.isHighRisk && !skipDrGuard && (isArchiverFailing || isRpoViolated) && !forceNoBackup) {
+        console.error(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+✖ HIGH-RISK MIGRATION PREFLIGHT BLOCKED: DISASTER RECOVERY GUARD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Migration contains high-risk operations:
+${highRiskAudit.reasons.map((r: string) => `  - ${r}`).join('\n')}
+
+SAFETY VIOLATIONS:`);
+        if (isArchiverFailing) {
+          console.error(`  - FAILING WAL ARCHIVE: pg_stat_archiver shows active archive failures. Point-in-time recovery is broken.`);
+        }
+        if (isRpoViolated) {
+          console.error(`  - RPO THRESHOLD EXCEEDED: ${backupReport?.violationReason ?? `Backup exceeds ${rpoHours}h limit.`}`);
+        }
+
+        console.error(`
+DIAGNOSTIC REMEDIATION STEPS:
+  1. Inspect PostgreSQL WAL archiving: SELECT * FROM pg_stat_archiver;
+  2. Verify or trigger a fresh backup before executing destructive migrations.
+  3. Run 'ddlforge doctor --db <url>' to check cluster recovery readiness.
+  4. To bypass this guard for testing or emergency maintenance, pass --force-no-backup.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`);
+        return 1;
+      }
+
       const hasFailures =
         (diskReport && !diskReport.passed) ||
         throttleDecision.shouldThrottle ||
@@ -2929,6 +3183,8 @@ FLAGS:
               })),
             },
             configReport,
+            disasterReadiness: disasterReport,
+            backupAudit: backupReport,
             passed: !hasFailures,
           },
           null,
@@ -2978,6 +3234,32 @@ FLAGS:
       }
       for (const risk of configReport.risks) {
         console.log(`  - [${risk.severity}] ${risk.setting} = "${risk.currentValue}": ${risk.message}`);
+      }
+
+      if (disasterReport) {
+        console.log(`
+[4] CONTINUOUS WAL ARCHIVING & DISASTER RECOVERY
+  Archiver Status:           ${disasterReport.archiver.status} (${disasterReport.archiver.archivedCount} archived, ${disasterReport.archiver.failedCount} failed)
+  Replication Slots:         ${disasterReport.replicationSlots.hasDangerousSlots ? 'HAZARDOUS' : 'HEALTHY'}
+  Standby Lag LSN:           ${disasterReport.standbys.hasLaggingStandby ? 'LAGGING' : 'SYNCHRONIZED'}`);
+        if (!disasterReport.isReady) {
+          for (const b of disasterReport.blockers) {
+            console.log(`  - BLOCKER: ${b}`);
+          }
+        }
+      }
+
+      if (backupReport) {
+        console.log(`
+[5] BACKUP RECENCY & RPO COMPLIANCE
+  Provider:                  ${backupReport.provider}
+  RPO Threshold:             ${backupReport.rpoHours} hours
+  Latest Backup:             ${backupReport.latestBackup ? backupReport.latestBackup.backupId : 'None'}
+  Backup Age:                ${backupReport.actualAgeHours !== null ? `${backupReport.actualAgeHours.toFixed(1)} hours` : 'N/A'}
+  RPO Status:                ${backupReport.isCompliant ? '✔ COMPLIANT' : '✖ NON-COMPLIANT'}`);
+        if (!backupReport.isCompliant) {
+          console.log(`  - Violation: ${backupReport.violationReason}`);
+        }
       }
 
       console.log(`
@@ -3064,5 +3346,285 @@ FLAGS:
 
   return headroom.hasSufficientSpace ? 0 : 1;
 }
+
+/**
+ * Executes the `ddlforge doctor` subcommand.
+ */
+export async function runDoctor(argv: string[]): Promise<number> {
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let format: 'terminal' | 'json' = 'terminal';
+  let staleMinutes = 15;
+  let maxLagMb = 100;
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge doctor [options]
+
+Continuous WAL archival health, replication slot bloat, and disaster recovery readiness doctor.
+
+FLAGS:
+  --db <url>            PostgreSQL connection URL (defaults to DATABASE_URL env var)
+  --format <type>       Output format: terminal | json (default: terminal)
+  --stale-minutes <n>   Archive staleness threshold in minutes (default: 15)
+  --max-lag-mb <n>      Standby replay lag threshold in MB (default: 100)
+  --help, -h            Print this help message and exit
+`);
+      return 0;
+    }
+
+    if (arg === '--db') {
+      i++;
+      if (i < argv.length) dbUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      dbUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--format') {
+      i++;
+      if (i < argv.length && (argv[i] === 'json' || argv[i] === 'terminal')) {
+        format = argv[i] as any;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length);
+      if (f === 'json' || f === 'terminal') format = f as any;
+      i++;
+      continue;
+    }
+
+    if (arg === '--stale-minutes') {
+      i++;
+      if (i < argv.length) staleMinutes = parseInt(argv[i], 10) || 15;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--stale-minutes=')) {
+      staleMinutes = parseInt(arg.slice('--stale-minutes='.length), 10) || 15;
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-lag-mb') {
+      i++;
+      if (i < argv.length) maxLagMb = parseInt(argv[i], 10) || 100;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-lag-mb=')) {
+      maxLagMb = parseInt(arg.slice('--max-lag-mb='.length), 10) || 100;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (!dbUrl) {
+    console.error('ddlforge doctor: Missing required database connection URL (--db or DATABASE_URL).');
+    return 1;
+  }
+
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: dbUrl });
+
+  try {
+    const { auditDisasterReadiness, formatDoctorReportTerminal, recordSafetyLog } = await import('./recovery/index.js');
+    const report = await auditDisasterReadiness(pool, {
+      staleArchiveIntervalMs: staleMinutes * 60 * 1000,
+      maxStandbyLagBytes: BigInt(maxLagMb) * 1024n * 1024n,
+    });
+
+    // Record in migration safety log
+    await recordSafetyLog(pool, {
+      eventType: 'doctor_check',
+      targetIdentifier: dbUrl.replace(/:[^:@]+@/, ':***@'),
+      status: report.isReady ? (report.warnings.length > 0 ? 'WARNING' : 'PASSED') : 'FAILED',
+      details: {
+        archiverStatus: report.archiver.status,
+        archivedCount: report.archiver.archivedCount.toString(),
+        failedCount: report.archiver.failedCount.toString(),
+        isReady: report.isReady,
+        blockers: report.blockers,
+        warnings: report.warnings,
+      },
+    });
+
+    if (format === 'json') {
+      console.log(
+        JSON.stringify(
+          {
+            ...report,
+            archiver: {
+              ...report.archiver,
+              archivedCount: report.archiver.archivedCount.toString(),
+              failedCount: report.archiver.failedCount.toString(),
+            },
+            replicationSlots: {
+              ...report.replicationSlots,
+              totalRetainedBytes: report.replicationSlots.totalRetainedBytes.toString(),
+              slots: report.replicationSlots.slots.map(s => ({
+                ...s,
+                retainedBytes: s.retainedBytes.toString(),
+              })),
+              dangerousSlots: report.replicationSlots.dangerousSlots.map(s => ({
+                ...s,
+                retainedBytes: s.retainedBytes.toString(),
+              })),
+              inactiveSlots: report.replicationSlots.inactiveSlots.map(s => ({
+                ...s,
+                retainedBytes: s.retainedBytes.toString(),
+              })),
+            },
+            standbys: {
+              ...report.standbys,
+              maxReplayLagBytes: report.standbys.maxReplayLagBytes.toString(),
+              standbys: report.standbys.standbys.map(s => ({
+                ...s,
+                replayLagBytes: s.replayLagBytes.toString(),
+              })),
+            },
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      console.log(formatDoctorReportTerminal(report));
+    }
+
+    return report.isReady ? 0 : 1;
+  } catch (err: any) {
+    console.error(`ddlforge doctor error: ${err.message}`);
+    return 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
+/**
+ * Executes the `ddlforge verify-backup` subcommand.
+ */
+export async function runVerifyBackup(argv: string[]): Promise<number> {
+  let targetUrl = process.env['DATABASE_URL'] ?? '';
+  let rpoHours = 24;
+  let skipAmcheck = false;
+  let format: 'terminal' | 'json' = 'terminal';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge verify-backup [options]
+
+Verify restored PostgreSQL instance health, recovery completion, and B-Tree index integrity.
+
+FLAGS:
+  --target-url <url>    Target database URL to verify (defaults to --db or DATABASE_URL)
+  --db <url>            Alias for --target-url
+  --rpo-hours <n>       Maximum acceptable RPO threshold in hours (default: 24)
+  --skip-amcheck        Skip B-Tree index corruption checks via amcheck
+  --format <type>       Output format: terminal | json (default: terminal)
+  --help, -h            Print this help message and exit
+`);
+      return 0;
+    }
+
+    if (arg === '--target-url' || arg === '--db') {
+      i++;
+      if (i < argv.length) targetUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--target-url=')) {
+      targetUrl = arg.slice('--target-url='.length);
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      targetUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--rpo-hours') {
+      i++;
+      if (i < argv.length) rpoHours = parseInt(argv[i], 10) || 24;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--rpo-hours=')) {
+      rpoHours = parseInt(arg.slice('--rpo-hours='.length), 10) || 24;
+      i++;
+      continue;
+    }
+
+    if (arg === '--skip-amcheck') {
+      skipAmcheck = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--format') {
+      i++;
+      if (i < argv.length && (argv[i] === 'json' || argv[i] === 'terminal')) {
+        format = argv[i] as any;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length);
+      if (f === 'json' || f === 'terminal') format = f as any;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (!targetUrl) {
+    console.error('ddlforge verify-backup: Missing required target database connection URL (--target-url, --db or DATABASE_URL).');
+    return 1;
+  }
+
+  const { Pool } = await import('pg');
+  const pool = new Pool({ connectionString: targetUrl });
+
+  try {
+    const { verifyRestoredInstance, formatRestoreReportTerminal } = await import('./recovery/index.js');
+    const report = await verifyRestoredInstance(pool, {
+      targetUrl,
+      skipAmcheck,
+      rpoHours,
+    });
+
+    if (format === 'json') {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(formatRestoreReportTerminal(report));
+    }
+
+    return report.passed ? 0 : 1;
+  } catch (err: any) {
+    console.error(`ddlforge verify-backup error: ${err.message}`);
+    return 1;
+  } finally {
+    await pool.end().catch(() => {});
+  }
+}
+
 
 

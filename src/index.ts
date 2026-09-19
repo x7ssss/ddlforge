@@ -44,3 +44,5 @@ export * from './partition/index.js';
 // Pre-flight (Disk & Mount Guard, Replication Lag, Config Risk Auditor)
 export * from './preflight/index.js';
 
+// Recovery (Continuous WAL Archiving, Backup RPO Auditor & Restore Verification Engine)
+export * from './recovery/index.js';

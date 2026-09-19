@@ -189,4 +189,48 @@
 - `test/preflight/replicationGuard.test.ts`: Unit tests for 64-bit BigInt LSN parsing, diff calculation, standby lag evaluation, and dynamic backoff throttle delays.
 - `test/preflight/configAudit.test.ts`: Unit tests for hazardous configuration rules, version-aware checkpoint telemetry routing (PG 16 vs PG 17), and forced checkpoint pressure ratings.
 - `test/preflight/cli.test.ts`: CLI help flags, argument parsing, simulation mode, and database introspection workflows.
+
+---
+
+## ✅ v1.6.0: Disaster Recovery Readiness, Continuous WAL Archival Health, and Backup Verification Engine (COMPLETED)
+
+### 1. Continuous WAL Archiving & Slot Health Guard (`src/recovery/pitrGuard.ts`)
+- **Archiver State Machine**: Direct inspection of `pg_stat_archiver` classifying continuous WAL archival health across five deterministic states:
+  - `HEALTHY`: Recent successful archives with zero failed runs.
+  - `RECOVERED`: Successful archives completed following past failures.
+  - `FAILING_NOW`: Active `archive_command` failures occurring within the last 1 hour or since the latest successful archive.
+  - `STALE_ARCHIVE`: No successful archives within the staleness interval (default: 15 minutes).
+  - `NEVER_ARCHIVED`: Unconfigured or non-functional continuous archiving.
+- **Replication Slot Bloat Detection**: Inspects `pg_replication_slots` to identify inactive slots and dangerous `wal_status` values (`extended`, `unreserved`, `lost`) pinning WAL segments and risking out-of-disk server panics.
+- **LSN Distance Evaluation**: Computes real-time byte distance between primary WAL write position and standby replay locations via 64-bit BigInt arithmetic (`calculateLsnDiff`).
+- **CLI Command**: `ddlforge doctor [--db <url>] [--stale-minutes <n>] [--max-lag-mb <n>] [--format terminal|json]`.
+
+### 2. Backup Recency Auditor & RPO Compliance Engine (`src/recovery/backupAuditor.ts`)
+- **Multi-Provider Verification Engine**:
+  - `catalog`: Inspects `ddlforge.backup_catalog` for latest completed physical or logical backups.
+  - `pgbackrest`: Parses `pgbackrest info --output=json` manifests, extracting backup stop timestamps, sizes, and LSN boundaries across full, diff, and incr backups while filtering errored runs.
+  - `mock` / `manual`: Deterministic simulation provider for testing and automated pipelines.
+- **RPO Threshold Enforcement**: Automatically evaluates backup age against Recovery Point Objective constraints (default: 24h), raising `RpoViolationError` on non-compliant backups.
+- **High-Risk Operation Interception**: Automatically detects destructive DDL statements (`DROP TABLE`, `DROP COLUMN`, `ALTER TABLE ... TYPE`, `DETACH PARTITION`, `TRUNCATE`) and aborts execution when RPO is breached or archiver is `FAILING_NOW`, unless explicitly overridden via `--force-no-backup`.
+
+### 3. Restore Verification Hook & Target Instance Health Engine (`src/recovery/verifyRestore.ts`)
+- **Post-Restoration Instance Validation**:
+  - **Recovery Completion**: Asserts `pg_is_in_recovery() = false` to guarantee that restore WAL replay has completed and the instance is read-write.
+  - **B-Tree Index Integrity (`amcheck`)**: Discovers all user B-Tree relations and executes `bt_index_check(oid, true)` to catch structural corruption before cutover.
+  - **Referential Integrity Audit**: Queries `pg_constraint` for unvalidated foreign keys (`convalidated = false`) left over from fast restoration or unfinished migrations.
+- **CLI Command**: `ddlforge verify-backup [--target-url <url>] [--rpo-hours <n>] [--skip-amcheck] [--format terminal|json]`.
+
+### 4. Migration Safety Ledger (`src/recovery/safetyLedger.ts`)
+- Persistent audit ledger recorded in `ddlforge.migration_safety_log`.
+- Tracks all doctor inspections, restore verification runs, and pre-flight migration safety gates with execution timestamps, target identifiers, status badges, and structured JSON diagnostics.
+
+### 5. Pre-flight & Circuit Breaker Integration
+- Wires `pitrGuard` and `backupAuditor` checks directly into `ddlforge preflight` and `ddlforge run`.
+- Halts destructive migrations before locks are acquired if continuous archiving is failing or backup RPO is violated.
+
+### 6. Test Suite (716 tests, 0 failures)
+- `test/recovery/pitrGuard.test.ts`: Unit tests for archiver health status classification across all 5 states, replication slot danger detection, and LSN distance evaluation.
+- `test/recovery/backupAuditor.test.ts`: Unit tests for `pgbackrest` JSON manifest parser, catalog backup recording and queries, RPO calculation, and high-risk operation detection.
+- `test/recovery/verifyRestore.test.ts`: Unit tests for recovery completion assertion, amcheck B-Tree integrity verification, unvalidated foreign keys, and safety ledger recording.
+- `test/recovery/cli.test.ts`: Unit tests for `ddlforge doctor`, `ddlforge verify-backup`, and CLI help screens and options.
 
