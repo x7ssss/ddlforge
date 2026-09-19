@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -159,6 +159,7 @@ USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
   ddlforge diff [options]                  # compare live database schema against migration ASTs
   ddlforge lock <status|release> [options] # inspect or clear distributed advisory locks
+  ddlforge mask <trigger|backfill|advice>  # in-flight data masking & PII anonymization
   ddlforge apply <file.sql> --db <url>     # apply a migration safely
   ddlforge wrap [options] -- <command...>  # supervise ORM migration deployments
   ddlforge split <file.sql>                # split mixed migration into tx and autocommit phases
@@ -167,6 +168,26 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+
+── MASK (in-flight PII anonymization) ────────────────────────────────
+  ddlforge mask trigger --table <table> --columns <col:type,...> [options]
+  ddlforge mask backfill --table <table> --columns <col:type,...> [options]
+  ddlforge mask advice --table <table> [options]
+
+SUBCOMMANDS:
+  trigger             Generate in-flight BEFORE INSERT OR UPDATE masking triggers
+  backfill            Generate keyset pagination batch procedure for historical data
+  advice              Emit storage, HOT update, and telemetry hardening recommendations
+
+FLAGS:
+  --table <table>     Target table name
+  --columns <list>    Comma-separated list of column:type pairs (types: email, integer, uuid, text, custom)
+  --pk <id>           Primary key column for keyset backfill (default: id)
+  --batch-size <n>    Batch size per backfill transaction commit (default: 2500)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --fillfactor <n>    Recommended table fillfactor for HOT optimization (default: 85)
+  --format <type>     Advisory output format: terminal | json (default: terminal)
+  --salt-guc <name>   Session GUC variable storing masking salt (default: app.masking_salt)
 
 ── DIFF (live schema drift) ──────────────────────────────────────────
   ddlforge diff [--db <url>] [--dir <path>] [--format <terminal|json>]
@@ -571,6 +592,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect diff subcommand
   if (argv[0] === 'diff') {
     return runDiff(argv.slice(1));
+  }
+
+  // Detect mask subcommand
+  if (argv[0] === 'mask') {
+    return runMask(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -1470,4 +1496,156 @@ EXAMPLES:
   } finally {
     await client.end().catch(() => {});
   }
+}
+
+/**
+ * Executes the `ddlforge mask` subcommand.
+ */
+export async function runMask(argv: string[]): Promise<number> {
+  const sub = argv[0];
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge mask — Native In-Flight Data Masking and Zero-Downtime PII Anonymization
+
+USAGE:
+  ddlforge mask trigger --table <table> --columns <col:type,...> [options]
+  ddlforge mask backfill --table <table> --columns <col:type,...> [options]
+  ddlforge mask advice --table <table> [options]
+
+SUBCOMMANDS:
+  trigger     Generate BEFORE ROW in-memory trigger and cryptographic helper functions
+  backfill    Generate keyset-paginated resumable backfill procedure with loop commits
+  advice      Emit storage (fillfactor/HOT), logging (track_utility), and verification checklist
+
+FLAGS:
+  --table <table>     Target physical table name (required)
+  --columns <specs>   Comma-separated list of column:type specifications (e.g. email:email,user_id:integer)
+  --pk <id>           Primary key column name for keyset backfill (default: id)
+  --batch-size <n>    Batch size per transaction commit for backfill (default: 2500)
+  --schema <name>     PostgreSQL schema name (default: public)
+  --fillfactor <n>    Recommended fillfactor for HOT updates (default: 85)
+  --format <type>     Output format for advice: terminal | json (default: terminal)
+  --salt-guc <name>   Session GUC variable storing the masking salt (default: app.masking_salt)
+  --help, -h          Print this help message
+`);
+    return 0;
+  }
+
+  let table = '';
+  let columnsStr = '';
+  let pk = 'id';
+  let batchSize = 2500;
+  let schema = 'public';
+  let fillfactor = 85;
+  let format: 'terminal' | 'json' = 'terminal';
+  let saltGuc = 'app.masking_salt';
+
+  let i = 1;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      return runMask(['--help']);
+    }
+
+    const nextArg = () => { i++; return i < argv.length ? argv[i] : ''; };
+
+    if (arg === '--table') { table = nextArg(); i++; continue; }
+    if (arg.startsWith('--table=')) { table = arg.slice('--table='.length); i++; continue; }
+
+    if (arg === '--columns') { columnsStr = nextArg(); i++; continue; }
+    if (arg.startsWith('--columns=')) { columnsStr = arg.slice('--columns='.length); i++; continue; }
+
+    if (arg === '--pk') { pk = nextArg(); i++; continue; }
+    if (arg.startsWith('--pk=')) { pk = arg.slice('--pk='.length); i++; continue; }
+
+    if (arg === '--batch-size') { batchSize = parseInt(nextArg(), 10) || 2500; i++; continue; }
+    if (arg.startsWith('--batch-size=')) { batchSize = parseInt(arg.slice('--batch-size='.length), 10) || 2500; i++; continue; }
+
+    if (arg === '--schema') { schema = nextArg(); i++; continue; }
+    if (arg.startsWith('--schema=')) { schema = arg.slice('--schema='.length); i++; continue; }
+
+    if (arg === '--fillfactor') { fillfactor = parseInt(nextArg(), 10) || 85; i++; continue; }
+    if (arg.startsWith('--fillfactor=')) { fillfactor = parseInt(arg.slice('--fillfactor='.length), 10) || 85; i++; continue; }
+
+    if (arg === '--salt-guc') { saltGuc = nextArg(); i++; continue; }
+    if (arg.startsWith('--salt-guc=')) { saltGuc = arg.slice('--salt-guc='.length); i++; continue; }
+
+    if (arg === '--format') {
+      const f = nextArg().toLowerCase();
+      if (f === 'json' || f === 'terminal') format = f;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length).toLowerCase();
+      if (f === 'json' || f === 'terminal') format = f;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (!table) {
+    console.error('ddlforge mask: --table <table> flag is required.');
+    return 1;
+  }
+
+  const columns = columnsStr
+    ? columnsStr.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
+
+  if (sub === 'trigger') {
+    if (columns.length === 0) {
+      console.error('ddlforge mask trigger: --columns <col:type,...> flag is required.');
+      return 1;
+    }
+    const { generateMaskingTrigger } = await import('./masking/triggers.js');
+    const res = generateMaskingTrigger({
+      table,
+      columns,
+      schema,
+      saltGuc,
+    });
+    console.log(res.fullSql);
+    return 0;
+  }
+
+  if (sub === 'backfill') {
+    if (columns.length === 0) {
+      console.error('ddlforge mask backfill: --columns <col:type,...> flag is required.');
+      return 1;
+    }
+    const { generateMaskingBackfill } = await import('./masking/backfill.js');
+    const res = generateMaskingBackfill({
+      table,
+      columns,
+      primaryKey: pk,
+      batchSize,
+      schema,
+      saltGuc,
+    });
+    console.log(res.fullSql);
+    return 0;
+  }
+
+  if (sub === 'advice') {
+    const { generateMaskingAdvice, formatMaskingAdviceTerminal, formatMaskingAdviceJson } = await import('./masking/advisor.js');
+    const report = generateMaskingAdvice({
+      table,
+      schema,
+      columns,
+      recommendedFillfactor: fillfactor,
+      saltGuc,
+    });
+    if (format === 'json') {
+      console.log(formatMaskingAdviceJson(report));
+    } else {
+      console.log(formatMaskingAdviceTerminal(report));
+    }
+    return 0;
+  }
+
+  console.error(`ddlforge mask: Unknown subcommand "${sub}". Supported subcommands: trigger, backfill, advice.`);
+  return 1;
 }

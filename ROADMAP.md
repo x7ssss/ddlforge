@@ -72,20 +72,32 @@
 
 ---
 
-## v1.2.0 Target: Native In-Flight Data Masking & PII Anonymization
+## ✅ v1.2.0: Native In-Flight Data Masking & PII Anonymization (COMPLETED)
 
 ### 1. In-Flight Trigger Masking (`src/masking/triggers.ts`)
-- Low-latency `BEFORE INSERT OR UPDATE` shadow column transformations (~0.05ms/row overhead).
-- Cryptographic deterministic tokenization via salted `HMAC-SHA256` with domain isolation tags (`domain || '|' || input`).
-- Lightweight PL/pgSQL Feistel integer ciphers for microsecond sequential ID anonymization without collisions.
-- Page storage optimization: automated recommendation of `fillfactor = 80-90` to maximize Heap-Only Tuple (HOT) updates and prevent WAL amplification.
+- Low-latency `BEFORE INSERT OR UPDATE` shadow column transformations (~0.05ms/row overhead) mutating `NEW` records in-memory without secondary `UPDATE`s.
+- Cryptographic deterministic tokenization via salted `HMAC-SHA256` (`_ddlforge_hmac_token`) with domain isolation tags (`domain || '|' || input`).
+- 16-round balanced Feistel integer cipher (`feistel_encrypt_integer`) in PL/pgSQL for microsecond sequential ID anonymization without collisions.
+- Deterministic email masking (`_ddlforge_mask_email`) and format-preserving UUID v5 masking (`_ddlforge_mask_uuid`).
+- Hardened function security: `SECURITY DEFINER SET search_path = pg_catalog, pg_temp` and recursion guard `WHEN (pg_trigger_depth() < 2)`.
+- CLI command: `ddlforge mask trigger --table <table> --columns <col1:type,col2:type>`.
 
 ### 2. Keyset Backfill Anonymization (`src/masking/backfill.ts`)
-- Integrated PII anonymization inside keyset-paginated batches (`LIMIT 2500 FOR UPDATE SKIP LOCKED`).
-- Foreign key referential integrity preservation: deterministic UUID v5 derivation (`uuid_generate_v5(namespace, hmac_token)`) synchronized across parent/child tables.
-- Handling cyclic dependencies during masking migrations via `SET CONSTRAINTS ALL DEFERRED`.
+- Resumable keyset-paginated backfill procedure (`LIMIT 2500 FOR UPDATE SKIP LOCKED`) with watermark advancement (`WHERE id > v_last_id`).
+- Loop `COMMIT` statements to flush WAL increments and release row locks.
+- Bounded `SET LOCAL lock_timeout = '2s'` with exponential backoff on `lock_not_available`.
+- Handling cyclic dependencies and foreign key integrity via `SET CONSTRAINTS ALL DEFERRED`.
+- CLI command: `ddlforge mask backfill --table <table> --columns <col1:type,col2:type> --pk <id>`.
 
-### 3. Secret Management & Catalog Leakage Hardening
-- Ephemeral GUC injection via `SET LOCAL app.masking_salt = ...` avoiding `pg_proc.prosrc` plaintext catalog exposure.
-- Telemetry shielding: suppressing sensitive data exposure in `pg_stat_statements` via `track_utility = off`.
-- Hardened function isolation: attaching `SECURITY DEFINER SET search_path = pg_catalog, pg_temp` to prevent schema search-path injection.
+### 3. Security & Storage Advisory Reporter (`src/masking/advisor.ts`)
+- Storage optimization: automated recommendation of `fillfactor = 85` to maximize Heap-Only Tuple (HOT) updates and prevent WAL amplification.
+- Secret management & catalog leakage hardening: dynamic GUC injection via `SET LOCAL app.masking_salt = ...` avoiding `pg_proc.prosrc` plaintext catalog exposure.
+- Telemetry shielding: advising `pg_stat_statements.track_utility = off` to suppress secret leaks in query logs.
+- Referential integrity verification queries checking for orphaned foreign keys post-backfill.
+- CLI command: `ddlforge mask advice --table <table> [--format terminal|json]`.
+
+### 4. Test Suite (553 tests, 0 failures)
+- `test/masking/triggers.test.ts`: Unit tests for HMAC tokenization, 16-round Feistel cipher, BEFORE ROW triggers, security definer guards, teardown SQL.
+- `test/masking/backfill.test.ts`: Keyset pagination, SKIP LOCKED, lock timeout backoff, loop commits, constraint deferral.
+- `test/masking/advisor.test.ts`: Fillfactor HOT update recommendations, telemetry shielding, referential integrity verification queries, formatters.
+- `test/masking/cli.test.ts`: CLI unit tests for trigger, backfill, advice subcommands and input validation.

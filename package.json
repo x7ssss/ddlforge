@@ -1,6 +1,6 @@
 {
   "name": "ddlforge",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Ultra-fast, zero-runtime-dependency Postgres migration lock linter and data-loss prevention engine CLI in Node.js 20+ and TypeScript",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -17,7 +17,7 @@
     "build": "tsc && node -e \"const fs=require('fs'); try{fs.chmodSync('dist/bin/ddlforge.js', 0o755)}catch{}\"",
     "build:action": "cd action && npm install && npx ncc build src/index.ts -o dist --license licenses.txt",
     "test:build": "tsc -p tsconfig.test.json",
-    "test": "npm run test:build && node --test dist/test/analyzer.test.js dist/test/runner.test.js dist/test/linter.test.js dist/test/reporter.test.js dist/test/wrapper.test.js dist/test/fuzz-parser.test.js dist/test/remediations.test.js dist/test/rules/concurrencyRules.test.js dist/test/rules/v070Rules.test.js dist/test/orchestrator/slicer.test.js dist/test/orchestrator/ledger.test.js dist/test/orchestrator/cli.test.js dist/test/orchestrator/virtualSchema.test.js dist/test/orchestrator/dualWrite.test.js dist/test/orchestrator/backfill.test.js dist/test/orchestrator/contract.test.js dist/test/reporters/github.test.js dist/test/harness/testHarness.test.js dist/test/cluster/advisory.test.js dist/test/diff/comparator.test.js dist/test/diff/catalog.test.js dist/test/diff/cli.test.js",
+    "test": "npm run test:build && node --test dist/test/analyzer.test.js dist/test/runner.test.js dist/test/linter.test.js dist/test/reporter.test.js dist/test/wrapper.test.js dist/test/fuzz-parser.test.js dist/test/remediations.test.js dist/test/rules/concurrencyRules.test.js dist/test/rules/v070Rules.test.js dist/test/orchestrator/slicer.test.js dist/test/orchestrator/ledger.test.js dist/test/orchestrator/cli.test.js dist/test/orchestrator/virtualSchema.test.js dist/test/orchestrator/dualWrite.test.js dist/test/orchestrator/backfill.test.js dist/test/orchestrator/contract.test.js dist/test/reporters/github.test.js dist/test/harness/testHarness.test.js dist/test/cluster/advisory.test.js dist/test/diff/comparator.test.js dist/test/diff/catalog.test.js dist/test/diff/cli.test.js dist/test/masking/triggers.test.js dist/test/masking/backfill.test.js dist/test/masking/advisor.test.js dist/test/masking/cli.test.js",
     "test:watch": "node --test --watch dist/test/analyzer.test.js dist/test/runner.test.js",
     "prepack": "node -e \"const fs=require('fs'); try{fs.rmSync('dist/test', {recursive:true, force:true})}catch{}\"",
     "prepublishOnly": "npm run build && node -e \"const fs=require('fs'); try{fs.rmSync('dist/test', {recursive:true, force:true})}catch{}\""

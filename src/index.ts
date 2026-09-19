@@ -34,3 +34,6 @@ export * from './cluster/index.js';
 
 // Diff (Schema Drift Introspection & AST Comparison)
 export * from './diff/index.js';
+
+// Masking (In-Flight Data Masking & Anonymization Engine)
+export * from './masking/index.js';
