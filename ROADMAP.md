@@ -1,108 +1,74 @@
-ddlforge Architecture Roadmap & Concurrency Research
-v0.7.0 Target: Modern ORM Traps & Transaction Boundary Safety
-1. Identity Sequence Contention & Reset Trap (identity-sequence-start-with)
-Severity: BLOCKER (Data Integrity Violation & AccessExclusiveLock)
+# ddlforge Engineering Roadmap
 
-Target SQL: ALTER TABLE ... ALTER COLUMN ... ADD GENERATED ALWAYS AS IDENTITY (... START WITH 1 ...)
+## Completed Milestones
+- **v0.5.x**: Baseline AST and Lock Footprint Engine (Core rules, lexer token stream, initial heuristics).
+- **v0.6.x**: Lock hierarchy tree, lock contention calculation, and multi-file project analysis.
+- **v0.7.0**: Modern ORM Traps & Transaction Boundaries.
+  - `identity-sequence-start-with`
+  - `attach-partition-missing-check`
+  - `enum-recreate-table-rewrite`
+  - `non-transactional-in-transaction` (Catching SQLSTATE 25001)
+  - `lock-accumulation-mixed-ddl-dml`
+- **v0.8.0**: Migration Orchestration & Safe Slicing.
+  - Byte-offset statement slicer (`ddlforge split`) preserving comments/formatting.
+  - Native SHA-256 ledger forging (`ddlforge forge --orm <prisma|drizzle>`).
+  - Automated in-place remediation (`ddlforge check --fix`).
+- **v0.9.0**: Virtual Schema & View-Based Expand/Contract Engine.
+  - Virtual schema routing via `search_path` (`ddlforge expand <file.sql> --version <v1|v2>`).
+  - Explicit `INSTEAD OF` triggers for ORM `RETURNING *` hydration and sequence capture.
+  - Dual-write PL/pgSQL triggers (`IS DISTINCT FROM`, `pg_trigger_depth() < 2`).
+  - Keyset-paginated asynchronous backfills (`ddlforge backfill`).
+  - Contract phase 3-release teardown with advisory locking (`ddlforge contract`).
 
-Hazard: ORMs (especially Drizzle) generate hardcoded sequence parameters when converting columns to IDENTITY. Statically applying START WITH 1 resets the sequence on populated tables, causing immediate UNIQUE CONSTRAINT collisions on the next INSERT.
+---
 
-Recipe:
-Safe Recipe: Inherit current max sequence value
-SET LOCAL lock_timeout = '2s';
-ALTER TABLE {table} ALTER COLUMN {column} ADD GENERATED ALWAYS AS IDENTITY;
-SELECT setval(pg_get_serial_sequence('{table}', '{column}'), coalesce(max({column}), 1), max({column}) IS NOT NULL) FROM {table};
+## v1.0.0 Target: Production Hardening, CI/CD & Live Harness
 
-2. Partition Attachment Sequential Scan Cascade (attach-partition-missing-check)
-Severity: BLOCKER (ShareUpdateExclusiveLock on parent + AccessExclusiveLock on partition)
+### 1. Standalone Bundled GitHub Action (`action/`)
+- Bundled TypeScript action compiled via `@vercel/ncc` into `action/dist/index.js`.
+- Inline PR diff annotations using workflow commands (`::error file={f},line={l},col={c}::{msg}`).
+- CLI flag `ddlforge check --format github` for workflow integration.
+- Strict exit code evaluation: fails CI check status on `BLOCKER`, logs warnings cleanly.
 
-Target SQL: ALTER TABLE {parent} ATTACH PARTITION {child} FOR VALUES FROM ... TO ...
+### 2. Ephemeral PostgreSQL Test Harness (`ddlforge test`)
+- Ephemeral PostgreSQL 17 test harness using `@testcontainers/postgresql`.
+- Schema-per-test isolation strategy for sub-second test execution across multi-phase DDL.
+- Concurrency Lock Poller:
+  - Samples `pg_locks` and `pg_stat_activity` every 50ms during live migration runs.
+  - Asserts that `AccessExclusiveLock` hold durations do not exceed specified thresholds (e.g. 500ms).
+- Graceful process exit handlers (`SIGINT`, `SIGTERM`, `unhandledRejection`) with Ryuk reaper fallback.
 
-Hazard: Synchronously attaching a partition forces PostgreSQL to run a full sequential scan to validate boundaries, locking the partition and queuing transactions.
+---
 
-Recipe:
-Phase 1: Add non-blocking boundary check constraint
-ALTER TABLE {child} ADD CONSTRAINT {child}_bound_chk CHECK ({col} >= '...' AND {col} < '...') NOT VALID;
-Phase 2: Validate concurrently without blocking writes
-ALTER TABLE {child} VALIDATE CONSTRAINT {child}_bound_chk;
-Phase 3: Instant metadata-only attach
-ALTER TABLE {parent} ATTACH PARTITION {child} FOR VALUES FROM '...' TO '...';
-Phase 4: Drop redundant check constraint
-ALTER TABLE {child} DROP CONSTRAINT {child}_bound_chk;
+## v1.1.0 Target: Distributed Coordination & Real-Time Topology
 
-3. Enum Type Rewrite Escalation (enum-recreate-table-rewrite)
-Severity: BLOCKER (AccessExclusiveLock & full physical table rewrite)
+### 1. Distributed Advisory Lock Clustering (`src/cluster/advisory.ts`)
+- Deterministic 64-bit BigInt key derivation via Node crypto SHA-256 slice (`readBigInt64BE(0)` on `ddlforge\0v1\0namespace`).
+- Transaction-scoped locking (`pg_try_advisory_xact_lock`) for PgBouncer/Supavisor transaction pooling safety.
+- Non-blocking polling loops with graceful abort and distributed state table heartbeat (`ddlforge_run`).
 
-Target SQL: Recreating an enum type and casting via ALTER COLUMN ... TYPE ... USING col::text::new_enum
+### 2. Live Schema Drift Detection & Reverse-Engineering (`ddlforge diff`)
+- High-speed, non-locking catalog queries against `pg_catalog` (avoiding `information_schema`) run under `REPEATABLE READ READ ONLY` with `lock_timeout = '250ms'`.
+- Decompiles table definitions, generated/identity columns (`pg_get_expr`), indexes (partial predicates, expressions), constraints (`convalidated` state), partitions (`pg_inherits`), and enum ordering (`enumsortorder`).
+- AST structural diffing via `libpg_query` normalized graphs (`SchemaGraph`) discarding location offsets and cosmetic formatting.
+- Defensive query safety: active lock contention monitor querying `pg_stat_activity` and `pg_blocking_pids()` with self-cancellation (`pg_cancel_backend`) if blocking OLTP transactions.
 
-Hazard: On tables with millions of rows, casting to a recreated enum rewrites every tuple on disk under an exclusive table lock.
+---
 
-Recipe: In PostgreSQL 16+, use ALTER TYPE ... RENAME VALUE. In older versions, keep deprecated enum values in catalog and enforce restrictions at the application layer.
+## v1.2.0 Target: Native In-Flight Data Masking & PII Anonymization
 
-4. Non-Transactional DDL in ORM Transaction (non-transactional-in-transaction)
-Severity: BLOCKER (PostgreSQL SQLSTATE 25001: active_sql_transaction)
+### 1. In-Flight Trigger Masking (`src/masking/triggers.ts`)
+- Low-latency `BEFORE INSERT OR UPDATE` shadow column transformations (~0.05ms/row overhead).
+- Cryptographic deterministic tokenization via salted `HMAC-SHA256` with domain isolation tags (`domain || '|' || input`).
+- Lightweight PL/pgSQL Feistel integer ciphers for microsecond sequential ID anonymization without collisions.
+- Page storage optimization: automated recommendation of `fillfactor = 80-90` to maximize Heap-Only Tuple (HOT) updates and prevent WAL amplification.
 
-Target SQL: CREATE INDEX CONCURRENTLY, DROP INDEX CONCURRENTLY, REINDEX CONCURRENTLY, VACUUM, ALTER TYPE ... ADD VALUE
+### 2. Keyset Backfill Anonymization (`src/masking/backfill.ts`)
+- Integrated PII anonymization inside keyset-paginated batches (`LIMIT 2500 FOR UPDATE SKIP LOCKED`).
+- Foreign key referential integrity preservation: deterministic UUID v5 derivation (`uuid_generate_v5(namespace, hmac_token)`) synchronized across parent/child tables.
+- Handling cyclic dependencies during masking migrations via `SET CONSTRAINTS ALL DEFERRED`.
 
-Hazard: PostgreSQL explicitly prohibits concurrent operations inside transaction blocks via PreventInTransactionBlock(). ORM runners (Prisma, Drizzle) wrap migrations in implicit transactions by default, causing migrations to abort immediately.
-
-Recipe:
-Prisma: Prepend -- prisma-migrate-disable-next-transaction to the first line.
-Drizzle: Separate concurrent statements into a standalone execution script run with autocommit mode.
-
-5. Multi-Statement Lock Accumulation Trap (lock-accumulation-mixed-ddl-dml)
-Severity: HIGH (Cascading Lock Queue Starvation & Pool Exhaustion)
-
-Target SQL: ALTER TABLE ... followed by UPDATE / INSERT / DELETE within the same transaction block.
-
-Hazard: Locks acquired in a transaction are held until COMMIT. An ACCESS EXCLUSIVE lock from a fast metadata ALTER TABLE will be held for the full duration of subsequent slow data backfills, blocking all application traffic.
-
-Recipe: Split the schema change and the backfill into separate migration phases. Run backfills in small, bounded, out-of-band transaction batches.
-
-v0.8.0 Target: Migration Orchestration, Byte-Offset Slicing & Ledger Forging
-1. AST-Based Migration Slicing (ddlforge split <file.sql>)
-4-Pass Statement Traversal:
-
-AST Node Classification (Autocommit-only vs Transactional).
-
-Directed Acyclic Graph (DAG) dependency mapping between target relations.
-
-Chronological grouping into Phase 1 (Transactional) and Phase 2 (Autocommit).
-
-Byte-Offset Extraction using libpg_query stmt_location and stmt_len to preserve developer comments, parameter placeholders, and formatting intact without destructive deparsing.
-
-Output Sequencing: Generates 0001_phase1_transaction.sql and 0001_phase2_autocommit.sql for deterministic CI/CD ordering.
-
-2. Native ORM Ledger Forging & Checksum Synchronization
-Prevent ORM redeploy crashes when migrations are executed out-of-band:
-a) Prisma (_prisma_migrations):
-
-Compute exact SHA-256 hex digest of the raw UTF-8 file contents.
-
-Forge ledger row with UUIDv4, applied_steps_count = 1, and timestamps.
-b) Drizzle ORM (drizzle.__drizzle_migrations):
-
-Compute SHA-256 over statement-breakpoint queries using Node crypto.
-
-Forge created_at utilizing dynamic epoch milliseconds (extract(epoch from now()) * 1000)::bigint to eliminate high-water mark merge-order skipping traps.
-
-3. Automated In-Place Migration Remediation (ddlforge check --fix)
-In-place patching of unsafe SQL files to generate non-blocking transactional recipes automatically.
-
-v0.9.0 Target: Virtual Schema & View-Based Expand/Contract Engine
-1. Dual-Schema View Routing via search_path
-Overlay physical tables with version-controlled schemas containing alias views (public_v1 vs public_v2).
-
-Allow old application nodes to read legacy column schemas while new deployments connect with SET search_path TO 'public_v2'.
-
-2. PL/pgSQL Dual-Write Triggers
-Install temporary BEFORE INSERT OR UPDATE triggers to mirror writes bidirectionally between expanded physical columns and legacy columns without locking.
-
-3. Batched Asynchronous CTID Backfills
-Zero-downtime historical backfills utilizing isolated micro-transactions:
-WITH batch AS (SELECT ctid FROM table WHERE new_col IS NULL LIMIT 2000 FOR UPDATE SKIP LOCKED) UPDATE table ... WHERE ctid = batch.ctid;
-
-Bounded locks with mandatory SET LOCAL lock_timeout = '2s' and exponential backoff.
-
-4. Contract Phase Finalization
-Automated trigger removal, legacy schema/view drops, physical column drops, and final rename operations once legacy traffic reaches zero.
+### 3. Secret Management & Catalog Leakage Hardening
+- Ephemeral GUC injection via `SET LOCAL app.masking_salt = ...` avoiding `pg_proc.prosrc` plaintext catalog exposure.
+- Telemetry shielding: suppressing sensitive data exposure in `pg_stat_statements` via `track_utility = off`.
+- Hardened function isolation: attaching `SECURITY DEFINER SET search_path = pg_catalog, pg_temp` to prevent schema search-path injection.

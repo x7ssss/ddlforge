@@ -38,7 +38,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '0.8.0';
+export const VERSION = '0.9.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -160,6 +160,9 @@ USAGE:
   ddlforge wrap [options] -- <command...>  # supervise ORM migration deployments
   ddlforge split <file.sql>                # split mixed migration into tx and autocommit phases
   ddlforge forge --orm <type> <file.sql>   # generate ledger SQL to mark out-of-band migration completed
+  ddlforge expand <file.sql> --version <v> # generate virtual schema views with INSTEAD OF triggers
+  ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
+  ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
 
 ── CHECK (lint) ──────────────────────────────────────────────────────
 ARGUMENTS:
@@ -173,6 +176,33 @@ FLAGS:
   --fix               Automatically apply safe remediation recipes in-place for detected blockers
   --version, -v       Print ddlforge version and exit
   --help, -h          Print this help message and exit
+
+── EXPAND (virtual schema) ───────────────────────────────────────────
+  ddlforge expand <migration-file.sql> --version <v1|v2>
+
+ARGUMENTS:
+  <migration-file.sql> Migration SQL defining tables/columns for the new version
+
+FLAGS:
+  --version <v1|v2>   Version tag for virtual schema (default: v2)
+
+── BACKFILL (keyset pagination) ──────────────────────────────────────
+  ddlforge backfill --table <table> --from <col_old> --to <col_new> [--pk <id>]
+
+FLAGS:
+  --table <table>     Target table name
+  --from <col_old>    Source column name
+  --to <col_new>      Target column name
+  --pk <id>           Primary key column name (default: id)
+  --batch-size <n>    Batch size per transaction commit (default: 5000)
+
+── CONTRACT (3-release teardown) ─────────────────────────────────────
+  ddlforge contract --table <table> --column <legacy_col> [--schema <public_v1>]
+
+FLAGS:
+  --table <table>       Target physical table
+  --column <legacy_col> Deprecated legacy column to drop
+  --schema <public_v1>  Deprecated virtual schema to drop (default: public_v1)
 
 ── SPLIT (slice migration) ───────────────────────────────────────────
   ddlforge split <file.sql>
@@ -225,6 +255,9 @@ EXAMPLES:
   $ ddlforge split ./migrations/001_mixed.sql
   $ ddlforge forge --orm prisma ./prisma/migrations/20260918_add_idx/migration.sql
   $ ddlforge forge --orm drizzle ./drizzle/0001_initial.sql
+  $ ddlforge expand ./migrations/002_add_bio.sql --version v2
+  $ ddlforge backfill --table users --from name --to full_name --pk id
+  $ ddlforge contract --table users --column name --schema public_v1
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb
   $ ddlforge apply ./migrations/001_add_index.sql --db postgres://localhost/mydb --dry-run
   $ ddlforge wrap -- npx prisma migrate deploy
@@ -479,6 +512,21 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect forge subcommand
   if (argv[0] === 'forge') {
     return runForge(argv.slice(1));
+  }
+
+  // Detect expand subcommand
+  if (argv[0] === 'expand') {
+    return runExpand(argv.slice(1));
+  }
+
+  // Detect backfill subcommand
+  if (argv[0] === 'backfill') {
+    return runBackfill(argv.slice(1));
+  }
+
+  // Detect contract subcommand
+  if (argv[0] === 'contract') {
+    return runContract(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -856,5 +904,194 @@ FLAGS:
   const { forgeLedger } = await import('./orchestrator/ledger.js');
   const res = forgeLedger(orm, fullPath);
   console.log(res.sql);
+  return 0;
+}
+
+/**
+ * Executes the `ddlforge expand` subcommand.
+ */
+export async function runExpand(argv: string[]): Promise<number> {
+  let file = '';
+  let version = 'v2';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge expand — Generate versioned virtual schema with INSTEAD OF triggers
+
+USAGE:
+  ddlforge expand <migration-file.sql> --version <v1|v2>
+
+FLAGS:
+  --version <v1|v2>    Target schema version tag (default: v2)
+`);
+      return 0;
+    }
+
+    if (arg === '--version') {
+      i++;
+      if (i < argv.length) version = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--version=')) {
+      version = arg.slice('--version='.length);
+      i++;
+      continue;
+    }
+
+    if (!arg.startsWith('-') && !file) {
+      file = arg;
+    }
+    i++;
+  }
+
+  if (!file) {
+    console.error('ddlforge expand: <migration-file.sql> argument is required.');
+    console.error('Usage: ddlforge expand <migration-file.sql> --version <v1|v2>');
+    return 1;
+  }
+
+  const fullPath = path.isAbsolute(file) ? file : path.resolve(process.cwd(), file);
+  if (!fs.existsSync(fullPath)) {
+    console.error(`ddlforge expand: File not found: "${file}"`);
+    return 1;
+  }
+
+  const { generateVirtualSchema } = await import('./orchestrator/virtualSchema.js');
+  const result = generateVirtualSchema({
+    version,
+    filePath: fullPath,
+  });
+
+  console.log(result.fullSql);
+  return 0;
+}
+
+/**
+ * Executes the `ddlforge backfill` subcommand.
+ */
+export async function runBackfill(argv: string[]): Promise<number> {
+  let table = '';
+  let fromCol = '';
+  let toCol = '';
+  let pk = 'id';
+  let batchSize = 5000;
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge backfill — Generate resumable keyset pagination backfill procedure
+
+USAGE:
+  ddlforge backfill --table <table> --from <col_old> --to <col_new> [--pk <id>]
+
+FLAGS:
+  --table <table>       Target table name
+  --from <col_old>      Source column name
+  --to <col_new>        Target column name
+  --pk <id>             Primary key column name (default: id)
+  --batch-size <n>      Batch size per transaction commit (default: 5000)
+`);
+      return 0;
+    }
+
+    const nextArg = () => { i++; return i < argv.length ? argv[i] : ''; };
+
+    if (arg === '--table') { table = nextArg(); i++; continue; }
+    if (arg.startsWith('--table=')) { table = arg.slice('--table='.length); i++; continue; }
+
+    if (arg === '--from') { fromCol = nextArg(); i++; continue; }
+    if (arg.startsWith('--from=')) { fromCol = arg.slice('--from='.length); i++; continue; }
+
+    if (arg === '--to') { toCol = nextArg(); i++; continue; }
+    if (arg.startsWith('--to=')) { toCol = arg.slice('--to='.length); i++; continue; }
+
+    if (arg === '--pk') { pk = nextArg(); i++; continue; }
+    if (arg.startsWith('--pk=')) { pk = arg.slice('--pk='.length); i++; continue; }
+
+    if (arg === '--batch-size') { batchSize = parseInt(nextArg(), 10) || 5000; i++; continue; }
+    if (arg.startsWith('--batch-size=')) { batchSize = parseInt(arg.slice('--batch-size='.length), 10) || 5000; i++; continue; }
+
+    i++;
+  }
+
+  if (!table || !fromCol || !toCol) {
+    console.error('ddlforge backfill: --table, --from, and --to flags are required.');
+    console.error('Usage: ddlforge backfill --table <table> --from <col_old> --to <col_new> [--pk <id>]');
+    return 1;
+  }
+
+  const { generateBackfillProcedure } = await import('./orchestrator/backfill.js');
+  const result = generateBackfillProcedure({
+    table,
+    fromColumn: fromCol,
+    toColumn: toCol,
+    primaryKey: pk,
+    batchSize,
+  });
+
+  console.log(result.fullSql);
+  return 0;
+}
+
+/**
+ * Executes the `ddlforge contract` subcommand.
+ */
+export async function runContract(argv: string[]): Promise<number> {
+  let table = '';
+  let column = '';
+  let schema = 'public_v1';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge contract — Generate GitLab 3-release zero-downtime teardown script
+
+USAGE:
+  ddlforge contract --table <table> --column <legacy_col> [--schema <public_v1>]
+
+FLAGS:
+  --table <table>       Target physical table
+  --column <legacy_col> Deprecated legacy column to drop
+  --schema <public_v1>  Deprecated virtual schema to drop (default: public_v1)
+`);
+      return 0;
+    }
+
+    const nextArg = () => { i++; return i < argv.length ? argv[i] : ''; };
+
+    if (arg === '--table') { table = nextArg(); i++; continue; }
+    if (arg.startsWith('--table=')) { table = arg.slice('--table='.length); i++; continue; }
+
+    if (arg === '--column') { column = nextArg(); i++; continue; }
+    if (arg.startsWith('--column=')) { column = arg.slice('--column='.length); i++; continue; }
+
+    if (arg === '--schema') { schema = nextArg(); i++; continue; }
+    if (arg.startsWith('--schema=')) { schema = arg.slice('--schema='.length); i++; continue; }
+
+    i++;
+  }
+
+  if (!table || !column) {
+    console.error('ddlforge contract: --table and --column flags are required.');
+    console.error('Usage: ddlforge contract --table <table> --column <legacy_col> [--schema <public_v1>]');
+    return 1;
+  }
+
+  const { generateContractScript } = await import('./orchestrator/contract.js');
+  const result = generateContractScript({
+    table,
+    column,
+    schema,
+  });
+
+  console.log(result.scriptSql);
   return 0;
 }

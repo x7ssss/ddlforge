@@ -286,3 +286,95 @@ describe('CLI: ddlforge check --fix', () => {
     }
   });
 });
+
+describe('CLI: ddlforge expand', () => {
+  it('generates virtual schema with views and instead-of triggers from migration SQL', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ddlforge-cli-expand-'));
+    const source = path.join(tmpDir, '001_users.sql');
+
+    try {
+      fs.writeFileSync(source, 'CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);', 'utf-8');
+
+      let stdout = '';
+      const origLog = console.log;
+      console.log = (msg: string) => { stdout += msg + '\n'; };
+
+      try {
+        const code = await runCli(['expand', source, '--version', 'v2']);
+        assert.strictEqual(code, 0);
+        assert.ok(stdout.includes('CREATE SCHEMA IF NOT EXISTS "public_v2";'));
+        assert.ok(stdout.includes('CREATE OR REPLACE VIEW "public_v2"."users" AS'));
+        assert.ok(stdout.includes('INSTEAD OF INSERT ON "public_v2"."users"'));
+        assert.ok(stdout.includes('SET search_path = "public_v2", "public";'));
+      } finally {
+        console.log = origLog;
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('exits with code 1 when target file is missing for expand', async () => {
+    const code = await runCli(['expand']);
+    assert.strictEqual(code, 1);
+  });
+});
+
+describe('CLI: ddlforge backfill', () => {
+  it('generates keyset pagination backfill procedure via CLI', async () => {
+    let stdout = '';
+    const origLog = console.log;
+    console.log = (msg: string) => { stdout += msg + '\n'; };
+
+    try {
+      const code = await runCli([
+        'backfill',
+        '--table', 'users',
+        '--from', 'name',
+        '--to', 'full_name',
+        '--pk', 'id',
+      ]);
+      assert.strictEqual(code, 0);
+      assert.ok(stdout.includes('CREATE OR REPLACE PROCEDURE "public"."sp_backfill_users_full_name"'));
+      assert.ok(stdout.includes('FOR UPDATE SKIP LOCKED'));
+      assert.ok(stdout.includes('CALL "public"."sp_backfill_users_full_name"();'));
+    } finally {
+      console.log = origLog;
+    }
+  });
+
+  it('exits with code 1 when required flags are omitted for backfill', async () => {
+    const code = await runCli(['backfill', '--table', 'users']);
+    assert.strictEqual(code, 1);
+  });
+});
+
+describe('CLI: ddlforge contract', () => {
+  it('generates 3-release teardown script with advisory lock and warnings via CLI', async () => {
+    let stdout = '';
+    const origLog = console.log;
+    console.log = (msg: string) => { stdout += msg + '\n'; };
+
+    try {
+      const code = await runCli([
+        'contract',
+        '--table', 'users',
+        '--column', 'name',
+        '--schema', 'public_v1',
+      ]);
+      assert.strictEqual(code, 0);
+      assert.ok(stdout.includes('GitLab 3-Release Teardown'));
+      assert.ok(stdout.includes('ALTER TABLE "public"."users" ALTER COLUMN "name" DROP NOT NULL;'));
+      assert.ok(stdout.includes('DROP VIEW IF EXISTS "public_v1"."users";'));
+      assert.ok(stdout.includes('pg_advisory_xact_lock'));
+      assert.ok(stdout.includes('cached plan must not change result type'));
+    } finally {
+      console.log = origLog;
+    }
+  });
+
+  it('exits with code 1 when required flags are omitted for contract', async () => {
+    const code = await runCli(['contract', '--table', 'users']);
+    assert.strictEqual(code, 1);
+  });
+});
