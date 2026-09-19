@@ -41,3 +41,6 @@ export * from './masking/index.js';
 // Partition (Declarative Partition Lifecycle, Conversion & Attachment)
 export * from './partition/index.js';
 
+// Pre-flight (Disk & Mount Guard, Replication Lag, Config Risk Auditor)
+export * from './preflight/index.js';
+

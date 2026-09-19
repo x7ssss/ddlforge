@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.4.0';
+export const VERSION = '1.5.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -157,6 +157,7 @@ ddlforge v${VERSION} — Ultra-fast, zero-dependency Postgres migration lock lin
 
 USAGE:
   ddlforge [paths...] [flags]              # lint/check migrations
+  ddlforge preflight [file.sql] [options]  # pre-flight blast radius, disk capacity & WAL forecasting
   ddlforge partition <cmd> [options]       # declarative partition lifecycle (convert, attach, detach, maintenance)
   ddlforge run <file.sql> --db <url>       # execute migration with autonomous lock pre-emption
   ddlforge top [options]                   # real-time lock contention & deadlock graph visualizer
@@ -171,6 +172,26 @@ USAGE:
   ddlforge backfill --table <table> ...    # generate resumable keyset pagination backfill procedure
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
+
+── PREFLIGHT (disk capacity, blast radius & WAL forecasting) ───────────
+  ddlforge preflight <file.sql> [options]
+
+ARGUMENTS:
+  <file.sql>          Migration SQL file to evaluate (optional)
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL env var)
+  --target-table <t>  Target table name for disk footprint estimation
+  --operation <type>  Operation type: create_index | table_rewrite | auto (default: auto)
+  --available-bytes <n> Available disk space in bytes (overrides live OS query)
+  --table-bytes <n>   Table size in bytes (for static/simulation runs)
+  --toast-bytes <n>   TOAST size in bytes (for static/simulation runs)
+  --indexes-bytes <n> Indexes size in bytes (for static/simulation runs)
+  --tuples <n>        Live + dead tuple count (for static/simulation runs)
+  --max-lag-mb <n>    Maximum acceptable replica lag in MB (default: 100)
+  --max-lag-sec <n>   Maximum acceptable replica lag in seconds (default: 10)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --format <type>     Output format: terminal | json (default: terminal)
 
 ── PARTITION (declarative partition lifecycle) ─────────────────────────
   ddlforge partition convert --table <table> --key <column> [options]
@@ -667,6 +688,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect mask subcommand
   if (argv[0] === 'mask') {
     return runMask(argv.slice(1));
+  }
+
+  // Detect preflight subcommand (disk capacity & replication lag forecaster)
+  if (argv[0] === 'preflight') {
+    return runPreflight(argv.slice(1));
   }
 
   // Detect partition subcommand (declarative partition lifecycle)
@@ -2597,6 +2623,446 @@ FLAGS:
 
   console.error(`ddlforge partition: Unknown subcommand "${sub}". Supported subcommands: convert, attach, detach, maintenance.`);
   return 1;
+}
+
+/**
+ * Pre-flight Blast Radius, Disk Capacity, and WAL Forecasting CLI handler.
+ */
+export async function runPreflight(argv: string[]): Promise<number> {
+  let file = '';
+  let dbUrl = process.env['DATABASE_URL'] ?? '';
+  let targetTable = '';
+  let operation: 'create_index' | 'table_rewrite' | 'auto' = 'auto';
+  let availableBytes: number | undefined;
+  let tableBytes: number | undefined;
+  let toastBytes: number | undefined;
+  let indexesBytes: number | undefined;
+  let tuples: number | undefined;
+  let maxLagMb = 100;
+  let maxLagSec = 10;
+  let schema = 'public';
+  let format: 'terminal' | 'json' = 'terminal';
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      console.log(`
+ddlforge preflight <file.sql> [options]
+
+Pre-flight blast radius, disk capacity, and WAL forecasting engine.
+
+ARGUMENTS:
+  <file.sql>               Path to migration SQL file to evaluate (optional)
+
+FLAGS:
+  --db <url>               PostgreSQL connection URL (or DATABASE_URL env var)
+  --target-table <tbl>     Target table name for disk footprint estimation
+  --operation <type>       Operation type: create_index | table_rewrite | auto (default: auto)
+  --available-bytes <n>    Available disk space in bytes (overrides live OS query)
+  --table-bytes <n>        Table size in bytes (for static/simulation runs)
+  --toast-bytes <n>        TOAST size in bytes (for static/simulation runs)
+  --indexes-bytes <n>      Indexes size in bytes (for static/simulation runs)
+  --tuples <n>             Live + dead tuple count (for static/simulation runs)
+  --max-lag-mb <n>         Maximum acceptable replica lag in MB (default: 100)
+  --max-lag-sec <n>        Maximum acceptable replica lag in seconds (default: 10)
+  --schema <name>          Database schema (default: public)
+  --format <type>          Output format: terminal | json (default: terminal)
+  --help, -h               Print this help message and exit
+`);
+      return 0;
+    }
+
+    if (arg === '--db') {
+      i++;
+      if (i < argv.length) dbUrl = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--db=')) {
+      dbUrl = arg.slice('--db='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--target-table') {
+      i++;
+      if (i < argv.length) targetTable = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--target-table=')) {
+      targetTable = arg.slice('--target-table='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--operation') {
+      i++;
+      if (i < argv.length) {
+        const op = argv[i].toLowerCase();
+        if (op === 'create_index' || op === 'table_rewrite' || op === 'auto') operation = op;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--operation=')) {
+      const op = arg.slice('--operation='.length).toLowerCase();
+      if (op === 'create_index' || op === 'table_rewrite' || op === 'auto') operation = op;
+      i++;
+      continue;
+    }
+
+    if (arg === '--available-bytes') {
+      i++;
+      if (i < argv.length) availableBytes = parseInt(argv[i], 10) || undefined;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--available-bytes=')) {
+      availableBytes = parseInt(arg.slice('--available-bytes='.length), 10) || undefined;
+      i++;
+      continue;
+    }
+
+    if (arg === '--table-bytes') {
+      i++;
+      if (i < argv.length) tableBytes = parseInt(argv[i], 10) || undefined;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--table-bytes=')) {
+      tableBytes = parseInt(arg.slice('--table-bytes='.length), 10) || undefined;
+      i++;
+      continue;
+    }
+
+    if (arg === '--toast-bytes') {
+      i++;
+      if (i < argv.length) toastBytes = parseInt(argv[i], 10) || undefined;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--toast-bytes=')) {
+      toastBytes = parseInt(arg.slice('--toast-bytes='.length), 10) || undefined;
+      i++;
+      continue;
+    }
+
+    if (arg === '--indexes-bytes') {
+      i++;
+      if (i < argv.length) indexesBytes = parseInt(argv[i], 10) || undefined;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--indexes-bytes=')) {
+      indexesBytes = parseInt(arg.slice('--indexes-bytes='.length), 10) || undefined;
+      i++;
+      continue;
+    }
+
+    if (arg === '--tuples') {
+      i++;
+      if (i < argv.length) tuples = parseInt(argv[i], 10) || undefined;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--tuples=')) {
+      tuples = parseInt(arg.slice('--tuples='.length), 10) || undefined;
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-lag-mb') {
+      i++;
+      if (i < argv.length) maxLagMb = parseInt(argv[i], 10) || 100;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-lag-mb=')) {
+      maxLagMb = parseInt(arg.slice('--max-lag-mb='.length), 10) || 100;
+      i++;
+      continue;
+    }
+
+    if (arg === '--max-lag-sec') {
+      i++;
+      if (i < argv.length) maxLagSec = parseInt(argv[i], 10) || 10;
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--max-lag-sec=')) {
+      maxLagSec = parseInt(arg.slice('--max-lag-sec='.length), 10) || 10;
+      i++;
+      continue;
+    }
+
+    if (arg === '--schema') {
+      i++;
+      if (i < argv.length) schema = argv[i];
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--schema=')) {
+      schema = arg.slice('--schema='.length);
+      i++;
+      continue;
+    }
+
+    if (arg === '--format') {
+      i++;
+      if (i < argv.length && (argv[i] === 'json' || argv[i] === 'terminal')) {
+        format = argv[i] as any;
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--format=')) {
+      const f = arg.slice('--format='.length);
+      if (f === 'json' || f === 'terminal') format = f as any;
+      i++;
+      continue;
+    }
+
+    if (!arg.startsWith('-') && !file) {
+      file = arg;
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  // Parse migration file if supplied
+  if (file) {
+    const resolvedPath = path.resolve(process.cwd(), file);
+    if (!fs.existsSync(resolvedPath)) {
+      console.error(`ddlforge preflight: Migration file not found: ${file}`);
+      return 1;
+    }
+    const sqlContent = fs.readFileSync(resolvedPath, 'utf-8');
+
+    // Auto-detect target table and operation if not explicitly provided
+    if (!targetTable) {
+      const indexMatch = sqlContent.match(/CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?(?:[^\s(]+\s+)?ON\s+([^\s(;]+)/i);
+      if (indexMatch) {
+        targetTable = indexMatch[1].replace(/["`]/g, '').trim();
+      } else {
+        const alterMatch = sqlContent.match(/ALTER\s+TABLE\s+(?:ONLY\s+)?(?:IF\s+EXISTS\s+)?([^\s(;]+)/i);
+        if (alterMatch) {
+          targetTable = alterMatch[1].replace(/["`]/g, '').trim();
+        }
+      }
+    }
+
+    if (operation === 'auto') {
+      if (/ALTER\s+TABLE.*(?:ALTER\s+COLUMN.*(?:TYPE|SET\s+DATA\s+TYPE)|CLUSTER|VACUUM\s+FULL)/is.test(sqlContent)) {
+        operation = 'table_rewrite';
+      } else {
+        operation = 'create_index';
+      }
+    }
+  }
+
+  const {
+    estimateIndexSpace,
+    estimateTableRewriteSpace,
+    detectSharedMount,
+    checkDiskHeadroom,
+    formatBytes,
+    evaluateReplicationThrottle,
+    auditSettings,
+  } = await import('./preflight/index.js');
+
+  const resolvedOperation = operation === 'auto' ? 'create_index' : operation;
+
+  // Branch 1: Live database introspection (--db specified)
+  if (dbUrl) {
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { auditDiskGuard, queryReplicationStatus, auditClusterConfig } = await import('./preflight/index.js');
+
+      let diskReport: any = null;
+      if (targetTable) {
+        try {
+          diskReport = await auditDiskGuard(pool, targetTable, {
+            schema,
+            operation: resolvedOperation,
+            availableBytes,
+          });
+        } catch (err: any) {
+          console.warn(`[ddlforge preflight] Disk guard query notice: ${err.message}`);
+        }
+      }
+
+      const replicas = await queryReplicationStatus(pool);
+      const throttleDecision = evaluateReplicationThrottle(replicas, {
+        maxLagBytes: BigInt(maxLagMb) * 1024n * 1024n,
+        maxLagSeconds: maxLagSec,
+      });
+
+      const configReport = await auditClusterConfig(pool);
+
+      const hasFailures =
+        (diskReport && !diskReport.passed) ||
+        throttleDecision.shouldThrottle ||
+        configReport.hasCriticalRisks;
+
+      if (format === 'json') {
+        const jsonOut = JSON.stringify(
+          {
+            targetTable: targetTable || null,
+            operation: resolvedOperation,
+            diskReport,
+            replication: {
+              replicaCount: throttleDecision.replicaCount,
+              shouldThrottle: throttleDecision.shouldThrottle,
+              recommendedThrottleMs: throttleDecision.recommendedThrottleMs,
+              maxObservedLagBytes: throttleDecision.maxObservedLagBytes.toString(),
+              maxObservedLagSeconds: throttleDecision.maxObservedLagSeconds,
+              laggingReplicas: throttleDecision.laggingReplicas.map(r => ({
+                ...r,
+                lagBytes: r.lagBytes.toString(),
+              })),
+            },
+            configReport,
+            passed: !hasFailures,
+          },
+          null,
+          2
+        );
+        console.log(jsonOut);
+        return hasFailures ? 1 : 0;
+      }
+
+      // Terminal Output
+      console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ddlforge v${VERSION} — Pre-flight Blast Radius & Disk Guard
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+      if (targetTable && diskReport) {
+        console.log(`
+[1] STORAGE & DISK CAPACITY GUARD (${schema}.${targetTable})
+  Operation:                 ${resolvedOperation.toUpperCase()}
+  Mount Topology:            ${diskReport.sharedMount.isSharedMount ? 'SHARED (Warning: data_directory & pg_wal share filesystem)' : 'ISOLATED'}
+  Disk Required:             ${formatBytes(diskReport.headroom.requiredBytes)} (with ${diskReport.headroom.safetyMultiplier}x headroom)
+  Available Disk Space:      ${formatBytes(diskReport.headroom.availableBytes)}
+  Projected Free Headroom:   ${formatBytes(diskReport.headroom.projectedRemainingBytes)} (${diskReport.headroom.projectedRemainingPercent.toFixed(1)}% remaining)
+  Status:                    ${diskReport.headroom.status === 'SAFE' ? '✔ SAFE' : diskReport.headroom.status}`);
+        if (diskReport.headroom.warning) {
+          console.log(`  Warning:                   ${diskReport.headroom.warning}`);
+        }
+      }
+
+      console.log(`
+[2] REPLICATION STANDBY LAG & WAL THROTTLE
+  Connected Standbys:        ${throttleDecision.replicaCount}
+  Max Observed Lag:          ${(Number(throttleDecision.maxObservedLagBytes) / (1024 * 1024)).toFixed(1)} MB / ${throttleDecision.maxObservedLagSeconds.toFixed(1)}s
+  Throttle Verdict:          ${throttleDecision.shouldThrottle ? `⚠ THROTTLE RECOMMENDED (Pause: ${throttleDecision.recommendedThrottleMs}ms)` : '✔ OPTIMAL (Within bounds)'}`);
+      if (throttleDecision.laggingReplicas.length > 0) {
+        for (const lag of throttleDecision.laggingReplicas) {
+          console.log(`  - Standby ${lag.applicationName}: ${lag.detail}`);
+        }
+      }
+
+      console.log(`
+[3] STATIC CONFIGURATION & CHECKPOINT AUDIT
+  Config Issues Found:       ${configReport.risks.length} (${configReport.risks.filter(r => r.severity === 'CRITICAL').length} critical, ${configReport.risks.filter(r => r.severity === 'HIGH').length} high)
+  Checkpoint Pressure:       ${configReport.checkpointHealth?.pressureLevel || 'LOW'} (${configReport.checkpointHealth?.forcedPercentage.toFixed(1) || 0}% forced)`);
+      if (configReport.checkpointHealth?.warning) {
+        console.log(`  Checkpoint Warning:        ${configReport.checkpointHealth.warning}`);
+      }
+      for (const risk of configReport.risks) {
+        console.log(`  - [${risk.severity}] ${risk.setting} = "${risk.currentValue}": ${risk.message}`);
+      }
+
+      console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PRE-FLIGHT VERDICT: ${hasFailures ? '✖ FAILED (Pre-flight safety constraints violated)' : '✔ PASSED (Cluster is ready for migration execution)'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`);
+
+      return hasFailures ? 1 : 0;
+    } catch (err: any) {
+      console.error(`ddlforge preflight: Database inspection error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  // Branch 2: Static / Offline Simulation Mode
+  const effectiveTable = targetTable || 'target_table';
+  const effectiveTuples = tuples ?? 1000000;
+  const effectiveTableBytes = tableBytes ?? 1000000000; // 1 GB
+  const effectiveToastBytes = toastBytes ?? 0;
+  const effectiveIndexesBytes = indexesBytes ?? 200000000; // 200 MB
+  const effectiveAvailableBytes = availableBytes ?? 50 * 1024 * 1024 * 1024; // 50 GB default
+
+  let requiredBytes = 0;
+  let indexEstimate: any = null;
+  let rewriteEstimate: any = null;
+
+  if (resolvedOperation === 'create_index') {
+    indexEstimate = estimateIndexSpace({
+      reltuples: effectiveTuples,
+      tableBytes: effectiveTableBytes,
+      safetyMultiplier: 1.75,
+    });
+    requiredBytes = indexEstimate.totalRequiredBytes;
+  } else {
+    rewriteEstimate = estimateTableRewriteSpace({
+      heapBytes: effectiveTableBytes,
+      toastBytes: effectiveToastBytes,
+      indexesBytes: effectiveIndexesBytes,
+      safetyMultiplier: 2.0,
+    });
+    requiredBytes = rewriteEstimate.totalRequiredBytes;
+  }
+
+  const headroom = checkDiskHeadroom(requiredBytes, effectiveAvailableBytes, 1.25);
+  const sharedMount = detectSharedMount(process.cwd());
+
+  if (format === 'json') {
+    console.log(
+      JSON.stringify(
+        {
+          mode: 'simulation',
+          table: effectiveTable,
+          operation: resolvedOperation,
+          indexEstimate,
+          rewriteEstimate,
+          headroom,
+          sharedMount,
+          passed: headroom.hasSufficientSpace,
+        },
+        null,
+        2
+      )
+    );
+    return headroom.hasSufficientSpace ? 0 : 1;
+  }
+
+  console.log(`
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ddlforge v${VERSION} — Pre-flight Blast Radius & Disk Forecast (Offline Simulation)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Target Table:              ${effectiveTable}
+  Planned Operation:         ${resolvedOperation.toUpperCase()}
+  Input Tuples:              ${effectiveTuples.toLocaleString()}
+  Required Disk Space:       ${formatBytes(requiredBytes)} (safety multiplier factored)
+  Available Disk Space:      ${formatBytes(effectiveAvailableBytes)}
+  Projected Post-DDL Free:   ${formatBytes(headroom.projectedRemainingBytes)} (${headroom.projectedRemainingPercent.toFixed(1)}% remaining)
+  Mount Topology:            ${sharedMount.isSharedMount ? 'SHARED (Warning)' : 'ISOLATED'}
+  Status:                    ${headroom.hasSufficientSpace ? '✔ PASSED' : '✖ INSUFFICIENT DISK'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+`);
+
+  return headroom.hasSufficientSpace ? 0 : 1;
 }
 
 

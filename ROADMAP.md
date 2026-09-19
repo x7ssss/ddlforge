@@ -157,4 +157,36 @@
 - `test/partition/detach.test.ts`: Concurrent autocommit detachment, non-concurrent transaction blocks, and FK anomaly remediation.
 - `test/partition/maintenance.test.ts`: Daily/monthly forward pre-allocation, retention detachment loops, and lock timeout protections.
 - `test/partition/cli.test.ts`: CLI help flags, subcommand routing, and missing argument validation for convert, attach, detach, maintenance.
+
+---
+
+## ✅ v1.5.0: Pre-flight Blast Radius, Disk Capacity, and WAL Forecasting Engine (COMPLETED)
+
+### 1. Disk & Mount Guard Engine (`src/preflight/diskGuard.ts`)
+- **Storage & Mount Topology**: Proactively inspects `pg_tablespace` and `pg_settings` for `data_directory` and `pg_wal` to detect shared-mount anti-patterns where sudden WAL volume surges can exhaust filesystem block space and cause database write freezes.
+- **Mathematical Footprint Estimation**:
+  - `CREATE INDEX CONCURRENTLY`: 1.5x-2x index size factoring in `maintenance_work_mem` spills to `pgsql_tmp` and safe tuple ceilings (`max(reltuples, n_live_tup + n_dead_tup)`).
+  - Table Rewrites: 2x heap + TOAST size validation, rebuilt index sizes, and WAL generation stream estimates.
+- **OS Disk Headroom Assertion**: Validates available disk space against safety multiplier bounds and asserts that projected remaining space does not breach the critical 15% system threshold.
+- CLI command: `ddlforge preflight <file.sql> [--db <url>] [--target-table <tbl>] [--operation create_index|table_rewrite] [--available-bytes <n>]`.
+
+### 2. Replication Lag & WAL Throttler (`src/preflight/replicationGuard.ts`)
+- **BigInt LSN Handling**: Native JavaScript 64-bit `BigInt` parsing of PostgreSQL hex LSN pairs (`XX/YYYYYYYY`) and `pg_wal_lsn_diff()` outputs without floating-point precision loss.
+- **Dynamic Standby Throttler**: Queries `pg_stat_replication` across streaming and cascading standbys, dynamically throttling backfill operations when replay lag exceeds byte (default: 100 MB) or duration (default: 10s) thresholds to prevent standby buffer saturation.
+
+### 3. Static Configuration Risk Auditor & Checkpoint Telemetry (`src/preflight/configAudit.ts`)
+- **Hazardous Settings Rules**: Audits `pg_settings` for production anti-patterns:
+  - `log_statement = 'all'`: Flagged as `CRITICAL` (excessive I/O and disk bloat during batch DDL).
+  - `full_page_writes = off`: Flagged as `CRITICAL` (unrecoverable torn-page corruption risk).
+  - `statement_timeout = 0`: Flagged as `HIGH` (unbounded migration lock holding).
+  - `lock_timeout = 0`: Flagged as `HIGH` (unbounded lock queue convoys).
+  - `autovacuum = off`: Flagged as `HIGH` (dead tuple bloat and wraparound risk).
+  - `maintenance_work_mem < 64MB`: Flagged as `MEDIUM` (forced external sort spills).
+- **Version-Aware Checkpoint Telemetry**: Dynamically routes checkpoint pressure monitoring between `pg_stat_bgwriter` (PostgreSQL <= 16) and `pg_stat_checkpointer` (PostgreSQL >= 17) to calculate forced checkpoint ratios (`checkpoints_req` / `num_requested`) and detect undersized `max_wal_size`.
+
+### 4. Test Suite
+- `test/preflight/diskGuard.test.ts`: Unit tests for index footprint estimation, memory spill detection, table rewrite 2x heap + TOAST formulas, shared mount analysis, and disk headroom checks.
+- `test/preflight/replicationGuard.test.ts`: Unit tests for 64-bit BigInt LSN parsing, diff calculation, standby lag evaluation, and dynamic backoff throttle delays.
+- `test/preflight/configAudit.test.ts`: Unit tests for hazardous configuration rules, version-aware checkpoint telemetry routing (PG 16 vs PG 17), and forced checkpoint pressure ratings.
+- `test/preflight/cli.test.ts`: CLI help flags, argument parsing, simulation mode, and database introspection workflows.
 
