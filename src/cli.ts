@@ -39,7 +39,9 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.9.0';
+export const VERSION = '2.0.0';
+
+export { runDemo } from './demo.js';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -176,6 +178,41 @@ USAGE:
   ddlforge compact <estimate|table|index>  # zero-downtime table compaction & bloat estimator
   ddlforge tenant <migrate|audit|sweep>    # multi-tenant distribution & drift auditing
   ddlforge advisor <analyze|simulate|prune> # autonomous telemetry, hypopg simulation & index pruner
+  ddlforge mesh <init|cutover|sync-sequences|establish-rollback|rollback> # zero-data-loss blue/green migration mesh
+  ddlforge demo [options]                  # interactive reliability walkthrough & zero-dependency showcase
+
+── MESH (zero-data-loss blue/green migration mesh) ────────────────
+  ddlforge mesh init --blue <url> --green <url> [options]
+  ddlforge mesh cutover --blue <url> --green <url> --db <name> [options]
+  ddlforge mesh sync-sequences --blue <url> --green <url> [options]
+  ddlforge mesh establish-rollback --blue <url> --green <url> [options]
+  ddlforge mesh rollback --blue <url> --green <url> --db <name> [options]
+
+INIT FLAGS:
+  --blue <url>        Blue (source) PostgreSQL connection URL
+  --green <url>       Green (target) PostgreSQL connection URL
+  --publication <n>   Publication name on Blue (default: ddlforge_blue_pub)
+  --slot <name>       Replication slot name (default: ddlforge_mesh_slot)
+  --dry-run           Preview actions without executing
+  --format <type>     Output format: terminal | json (default: terminal)
+
+CUTOVER FLAGS:
+  --blue <url>        Blue (source) PostgreSQL connection URL
+  --green <url>       Green (target) PostgreSQL connection URL
+  --db <name>         Database name to fence (required)
+  --role <name>       Role name to fence (optional)
+  --slot <name>       Replication slot name (default: ddlforge_mesh_slot)
+  --padding <n>       Sequence padding watermark (default: 1000)
+  --timeout-ms <n>    Maximum cutover timeout in ms (default: 120000)
+  --dry-run           Simulate cutover without making changes
+  --format <type>     Output format: terminal | json (default: terminal)
+
+── DEMO (interactive reliability walkthrough) ─────────────────────
+  ddlforge demo [options]
+
+FLAGS:
+  --instant, -i       Run instantly without pacing delays (for CI and tests)
+  --help, -h          Print this help message and exit
 
 ── ADVISOR (query telemetry, hypopg simulation & index pruner) ─
   ddlforge advisor analyze [options]
@@ -856,6 +893,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect mesh subcommand (zero-data-loss blue/green migration mesh)
   if (argv[0] === 'mesh') {
     return runMesh(argv.slice(1));
+  }
+
+  // Detect demo subcommand (interactive reliability simulation)
+  if (argv[0] === 'demo') {
+    const { runDemo } = await import('./demo.js');
+    return runDemo(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)

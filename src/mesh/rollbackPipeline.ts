@@ -192,21 +192,48 @@ export async function executeRollback(options: RollbackOptions): Promise<Rollbac
 }
 
 export function formatRollbackReportTerminal(report: RollbackReport): string {
-  let output = `Rollback Run ID: ${report.runId}\n`;
-  output += `Final Phase: ${report.finalPhase}\n`;
-  output += `Total Duration: ${report.totalDurationMs}ms\n\n`;
-  output += `Phases:\n`;
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('  ddlforge v2.0.0 — Emergency Rollback Pipeline');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push(`Rollback Run ID: ${report.runId}`);
+  lines.push(`Final Phase:     ${report.finalPhase}`);
+  lines.push(`Total Duration:  ${report.totalDurationMs}ms`);
+  lines.push(`Target DB:       "${report.databaseName}" (Mode: ${report.dryRun ? 'DRY RUN' : 'ACTIVE'})`);
+  if (report.fenceLsn) lines.push(`Fence LSN:       ${report.fenceLsn}`);
+  lines.push('');
+  lines.push('Phases:');
   for (const p of report.phases) {
-    output += `- ${p.phase} [${p.durationMs ?? 0}ms]: ${p.details}\n`;
+    const badge = `[${p.phase}]`;
+    lines.push(`- ${badge.padEnd(18)} [${p.durationMs ?? 0}ms]: ${p.details}`);
   }
-  return output;
+  lines.push('');
+  if (report.finalPhase === 'COMPLETE') {
+    lines.push('  ✔ EMERGENCY ROLLBACK COMPLETE: Blue is restored as authoritative.');
+  } else {
+    lines.push(`  ✖ ROLLBACK STATUS: ${report.finalPhase}`);
+  }
+  lines.push('');
+  return lines.join('\n');
 }
 
 export function formatEstablishReportTerminal(report: RollbackEstablishReport): string {
-  let output = `Rollback Establish Report:\n`;
-  output += `Dry Run: ${report.dryRun}\n`;
-  output += `Executed: ${report.executed}\n\n`;
-  output += `Reverse Publication SQL: ${report.reverseSetup.reversePublicationSql}\n`;
-  output += `Reverse Subscription SQL: ${report.reverseSetup.reverseSubscriptionSql}\n`;
-  return output;
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('  ddlforge v2.0.0 — Bi-Directional Rollback Parachute (Active/Passive)');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push(`Rollback Establish Report:`);
+  lines.push(`Dry Run:                 ${report.dryRun ? 'YES' : 'NO'}`);
+  lines.push(`Executed:                ${report.executed ? 'YES' : 'NO'}`);
+  lines.push(`Reverse Publication:     ${report.reverseSetup.reversePublicationName}`);
+  lines.push(`Reverse Subscription:    ${report.reverseSetup.reverseSubscriptionName}`);
+  lines.push(`Replication Safety:      [origin = 'none'] (Prevents infinite echoing loops)`);
+  lines.push('');
+  lines.push(`Reverse Publication SQL: ${report.reverseSetup.reversePublicationSql}`);
+  lines.push(`Reverse Subscription SQL: ${report.reverseSetup.reverseSubscriptionSql}`);
+  lines.push('');
+  return lines.join('\n');
 }
+

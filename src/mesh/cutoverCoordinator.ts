@@ -142,12 +142,29 @@ export async function executeCutover(options: CutoverOptions): Promise<CutoverRe
 }
 
 export function formatCutoverReportTerminal(report: CutoverReport): string {
-  let output = `Cutover Run ID: ${report.runId}\n`;
-  output += `Final Phase: ${report.finalPhase}\n`;
-  output += `Total Duration: ${report.totalDurationMs}ms\n\n`;
-  output += `Phases:\n`;
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('  ddlforge v2.0.0 — Zero-Data-Loss Blue/Green Mesh Cutover');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push(`Cutover Run ID: ${report.runId}`);
+  lines.push(`Final Phase:    ${report.finalPhase}`);
+  lines.push(`Total Duration: ${report.totalDurationMs}ms`);
+  lines.push(`Target DB:      "${report.databaseName}" (Mode: ${report.dryRun ? 'DRY RUN' : 'ACTIVE'})`);
+  if (report.fenceLsn) lines.push(`Fence LSN:      ${report.fenceLsn}`);
+  lines.push('');
+  lines.push('Phases:');
   for (const p of report.phases) {
-    output += `- ${p.phase} [${p.durationMs ?? 0}ms]: ${p.details}\n`;
+    const badge = `[${p.phase}]`;
+    lines.push(`- ${badge.padEnd(18)} [${p.durationMs ?? 0}ms]: ${p.details}`);
   }
-  return output;
+  lines.push('');
+  if (report.finalPhase === 'COMPLETE') {
+    lines.push('  ✔ ZERO-DATA-LOSS CUTOVER COMPLETE: Green is authoritative.');
+  } else {
+    lines.push(`  ✖ CUTOVER STATUS: ${report.finalPhase}`);
+  }
+  lines.push('');
+  return lines.join('\n');
 }
+

@@ -165,19 +165,37 @@ export async function initializeMesh(options: MeshInitOptions): Promise<MeshInit
 
 export function formatMeshInitReportTerminal(report: MeshInitReport): string {
   const p = report.preflightBlue;
-  let output = `Mesh Init Report (Dry Run: ${report.dryRun})\n`;
-  output += `--------------------------------------------------\n`;
-  output += `Overall Pass: ${p.overallPass ? 'YES' : 'NO'}\n`;
-  output += `WAL Level Logical: ${p.isWalLevelLogical}\n`;
-  output += `Available Slots: ${p.availableSlots}\n`;
-  output += `Unsafe Tables: ${p.unsafeTableCount}\n`;
+  const lines: string[] = [];
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('  ddlforge v2.0.0 — Zero-Data-Loss Blue/Green Migration Mesh');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push(`Mesh Init Report (Dry Run: ${report.dryRun ? 'YES' : 'NO'})`);
+  lines.push(`Overall Pass:      ${p.overallPass ? 'YES' : 'NO'}`);
+  lines.push(`WAL Level Logical: ${p.isWalLevelLogical ? 'YES' : 'NO'}`);
+  lines.push(`Available Slots:   ${p.availableSlots} (Used: ${p.usedReplicationSlots} / Max: ${p.maxReplicationSlots})`);
+  lines.push(`Unsafe Tables:     ${p.unsafeTableCount}`);
+  lines.push('');
+
   if (p.warnings.length > 0) {
-    output += `Warnings:\n`;
+    lines.push('Warnings:');
     for (const w of p.warnings) {
-      output += `  - ${w}\n`;
+      lines.push(`  - ${w}`);
     }
+    lines.push('');
   }
-  output += `\nPublication SQL: ${report.publicationSql}\n`;
-  output += `Subscription SQL: ${report.subscriptionSql}\n`;
-  return output;
+
+  lines.push('LOGICAL REPLICATION SETUP:');
+  lines.push('──────────────────────────────────────────────────────────────────────');
+  lines.push(`Publication SQL:  ${report.publicationSql}`);
+  lines.push(`Subscription SQL: ${report.subscriptionSql}`);
+  lines.push('──────────────────────────────────────────────────────────────────────');
+  if (p.overallPass) {
+    lines.push('  ✔ PREFLIGHT APPROVED: Blue database meets all logical replication requirements.');
+  } else {
+    lines.push('  ✖ PREFLIGHT BLOCKED: Blue database does not meet all replication requirements.');
+  }
+  lines.push('');
+  return lines.join('\n');
 }
+

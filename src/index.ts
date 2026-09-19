@@ -57,3 +57,6 @@ export * from './distributed/index.js';
 export * from './advisor/index.js';
 // Mesh (Zero-Data-Loss Blue/Green Migration Mesh, Logical CDC Switchover & Rollback Parachute)
 export * from './mesh/index.js';
+
+// Interactive Demo
+export * from './demo.js';
