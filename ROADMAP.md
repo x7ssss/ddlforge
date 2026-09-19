@@ -365,4 +365,5 @@
 - `test/advisor/pruner.test.ts`: Unit tests for prefix containment logic, redundant index identification, primary key / unique constraint exclusion, foreign key safety warnings, invalid index detection, live catalog query mocking, and terminal output formatting.
 - `test/advisor/cli.test.ts`: Unit tests for `ddlforge advisor` routing, `analyze`, `simulate`, and `prune` subcommands, help screens, and parameter validations.
 
-
+
+## ? v2.0.0: Zero-Data-Loss Blue/Green Migration Mesh, Logical CDC Switchover, and Bi-Directional Rollback Parachute (COMPLETED)

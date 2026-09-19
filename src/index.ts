@@ -55,3 +55,5 @@ export * from './distributed/index.js';
 
 // Advisor (Autonomous Query Telemetry, HypoPG Simulation & Index Lifecycle Advisor)
 export * from './advisor/index.js';
+// Mesh (Zero-Data-Loss Blue/Green Migration Mesh, Logical CDC Switchover & Rollback Parachute)
+export * from './mesh/index.js';

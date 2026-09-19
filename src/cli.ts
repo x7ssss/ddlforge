@@ -853,6 +853,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return runAdvisor(argv.slice(1));
   }
 
+  // Detect mesh subcommand (zero-data-loss blue/green migration mesh)
+  if (argv[0] === 'mesh') {
+    return runMesh(argv.slice(1));
+  }
+
   // Explicit check subcommand (e.g. ddlforge check ...)
   if (argv[0] === 'check') {
     argv = argv.slice(1);
@@ -5212,3 +5217,364 @@ FLAGS:
 
 
 
+
+export async function runMesh(argv: string[]): Promise<number> {
+  const sub = argv[0];
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge mesh <subcommand> [options]
+
+Zero-data-loss blue/green migration mesh with logical CDC switchover and bi-directional rollback.
+
+SUBCOMMANDS:
+  init                Validate Blue preflight and set up logical replication mesh
+  cutover             Execute 6-phase zero-data-loss cutover from Blue to Green
+  sync-sequences      Synchronize sequences from Blue to Green with safe padding
+  establish-rollback  Set up reverse replication for bi-directional rollback parachute
+  rollback            Execute emergency rollback from Green back to Blue
+
+EXAMPLES:
+  $ ddlforge mesh init --blue postgres://blue/mydb --green postgres://green/mydb
+  $ ddlforge mesh cutover --blue postgres://blue/mydb --green postgres://green/mydb --db mydb
+  $ ddlforge mesh sync-sequences --blue postgres://blue/mydb --green postgres://green/mydb
+  $ ddlforge mesh establish-rollback --blue postgres://blue/mydb --green postgres://green/mydb
+  $ ddlforge mesh rollback --blue postgres://blue/mydb --green postgres://green/mydb --db mydb
+`);
+    return 0;
+  }
+
+  // --- init subcommand ---
+  if (sub === 'init') {
+    const subArgs = argv.slice(1);
+    let blueUrl = '';
+    let greenUrl = '';
+    let publicationName = 'ddlforge_blue_pub';
+    let slotName = 'ddlforge_mesh_slot';
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge mesh init --blue <url> --green <url> [options]
+
+Validate Blue database preflight requirements and set up the logical replication mesh.
+
+FLAGS:
+  --blue <url>        Blue (source) PostgreSQL connection URL (required)
+  --green <url>       Green (target) PostgreSQL connection URL (required)
+  --publication <n>   Publication name on Blue (default: ddlforge_blue_pub)
+  --slot <name>       Replication slot name (default: ddlforge_mesh_slot)
+  --dry-run           Preview actions without executing
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--blue') { i++; if (i < subArgs.length) blueUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--blue=')) { blueUrl = arg.slice('--blue='.length); i++; continue; }
+      if (arg === '--green') { i++; if (i < subArgs.length) greenUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--green=')) { greenUrl = arg.slice('--green='.length); i++; continue; }
+      if (arg === '--publication') { i++; if (i < subArgs.length) publicationName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--publication=')) { publicationName = arg.slice('--publication='.length); i++; continue; }
+      if (arg === '--slot') { i++; if (i < subArgs.length) slotName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--slot=')) { slotName = arg.slice('--slot='.length); i++; continue; }
+      if (arg === '--dry-run') { dryRun = true; i++; continue; }
+      if (arg === '--format') { i++; if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any; i++; continue; }
+      if (arg.startsWith('--format=')) { const f = arg.slice('--format='.length); if (f === 'json' || f === 'terminal') format = f as any; i++; continue; }
+      i++;
+    }
+
+    if (!blueUrl) {
+      console.error('ddlforge mesh init: --blue <url> is required.');
+      return 1;
+    }
+    if (!greenUrl) {
+      console.error('ddlforge mesh init: --green <url> is required.');
+      return 1;
+    }
+
+    try {
+      const { initializeMesh, formatMeshInitReportTerminal } = await import('./mesh/index.js');
+      const report = await initializeMesh({ blueUrl, greenUrl, publicationName, slotName, dryRun, format });
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatMeshInitReportTerminal(report));
+      }
+      return report.preflightBlue.overallPass ? 0 : 1;
+    } catch (err: any) {
+      console.error(`ddlforge mesh init error: ${err.message}`);
+      return 1;
+    }
+  }
+
+  // --- cutover subcommand ---
+  if (sub === 'cutover') {
+    const subArgs = argv.slice(1);
+    let blueUrl = '';
+    let greenUrl = '';
+    let databaseName = '';
+    let roleName = '';
+    let slotName = 'ddlforge_mesh_slot';
+    let padding = 1000;
+    let timeoutMs = 120000;
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge mesh cutover --blue <url> --green <url> --db <name> [options]
+
+Execute 6-phase zero-data-loss cutover: Drain, Fence Blue, Capture Fence LSN,
+Wait Replication Parity, Sync Sequences, Promote Green.
+
+FLAGS:
+  --blue <url>        Blue (source) PostgreSQL connection URL (required)
+  --green <url>       Green (target) PostgreSQL connection URL (required)
+  --db <name>         Database name to fence (required)
+  --role <name>       Role name to fence (optional)
+  --slot <name>       Replication slot name (default: ddlforge_mesh_slot)
+  --padding <n>       Sequence padding watermark (default: 1000)
+  --timeout-ms <n>    Maximum cutover timeout in ms (default: 120000)
+  --dry-run           Simulate cutover without making changes
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--blue') { i++; if (i < subArgs.length) blueUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--blue=')) { blueUrl = arg.slice('--blue='.length); i++; continue; }
+      if (arg === '--green') { i++; if (i < subArgs.length) greenUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--green=')) { greenUrl = arg.slice('--green='.length); i++; continue; }
+      if (arg === '--db') { i++; if (i < subArgs.length) databaseName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--db=')) { databaseName = arg.slice('--db='.length); i++; continue; }
+      if (arg === '--role') { i++; if (i < subArgs.length) roleName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--role=')) { roleName = arg.slice('--role='.length); i++; continue; }
+      if (arg === '--slot') { i++; if (i < subArgs.length) slotName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--slot=')) { slotName = arg.slice('--slot='.length); i++; continue; }
+      if (arg === '--padding') { i++; if (i < subArgs.length) padding = parseInt(subArgs[i], 10) || 1000; i++; continue; }
+      if (arg.startsWith('--padding=')) { padding = parseInt(arg.slice('--padding='.length), 10) || 1000; i++; continue; }
+      if (arg === '--timeout-ms') { i++; if (i < subArgs.length) timeoutMs = parseInt(subArgs[i], 10) || 120000; i++; continue; }
+      if (arg.startsWith('--timeout-ms=')) { timeoutMs = parseInt(arg.slice('--timeout-ms='.length), 10) || 120000; i++; continue; }
+      if (arg === '--dry-run') { dryRun = true; i++; continue; }
+      if (arg === '--format') { i++; if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any; i++; continue; }
+      if (arg.startsWith('--format=')) { const f = arg.slice('--format='.length); if (f === 'json' || f === 'terminal') format = f as any; i++; continue; }
+      i++;
+    }
+
+    if (!blueUrl) { console.error('ddlforge mesh cutover: --blue <url> is required.'); return 1; }
+    if (!greenUrl) { console.error('ddlforge mesh cutover: --green <url> is required.'); return 1; }
+    if (!databaseName) { console.error('ddlforge mesh cutover: --db <name> is required.'); return 1; }
+
+    try {
+      const { executeCutover, formatCutoverReportTerminal } = await import('./mesh/index.js');
+      const report = await executeCutover({ blueUrl, greenUrl, databaseName, roleName: roleName || undefined, slotName, padding, timeoutMs, dryRun, format });
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatCutoverReportTerminal(report));
+      }
+      return report.finalPhase === 'COMPLETE' ? 0 : 1;
+    } catch (err: any) {
+      console.error(`ddlforge mesh cutover error: ${err.message}`);
+      return 1;
+    }
+  }
+
+  // --- sync-sequences subcommand ---
+  if (sub === 'sync-sequences') {
+    const subArgs = argv.slice(1);
+    let blueUrl = '';
+    let greenUrl = '';
+    let padding = 1000;
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge mesh sync-sequences --blue <url> --green <url> [options]
+
+Synchronize all serial and identity sequences from Blue to Green with safe padding.
+
+FLAGS:
+  --blue <url>        Blue (source) PostgreSQL connection URL (required)
+  --green <url>       Green (target) PostgreSQL connection URL (required)
+  --padding <n>       Sequence watermark padding above current max (default: 1000)
+  --dry-run           Preview setval() SQL without executing on Green
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--blue') { i++; if (i < subArgs.length) blueUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--blue=')) { blueUrl = arg.slice('--blue='.length); i++; continue; }
+      if (arg === '--green') { i++; if (i < subArgs.length) greenUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--green=')) { greenUrl = arg.slice('--green='.length); i++; continue; }
+      if (arg === '--padding') { i++; if (i < subArgs.length) padding = parseInt(subArgs[i], 10) || 1000; i++; continue; }
+      if (arg.startsWith('--padding=')) { padding = parseInt(arg.slice('--padding='.length), 10) || 1000; i++; continue; }
+      if (arg === '--dry-run') { dryRun = true; i++; continue; }
+      if (arg === '--format') { i++; if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any; i++; continue; }
+      if (arg.startsWith('--format=')) { const f = arg.slice('--format='.length); if (f === 'json' || f === 'terminal') format = f as any; i++; continue; }
+      i++;
+    }
+
+    if (!blueUrl) { console.error('ddlforge mesh sync-sequences: --blue <url> is required.'); return 1; }
+    if (!greenUrl) { console.error('ddlforge mesh sync-sequences: --green <url> is required.'); return 1; }
+
+    try {
+      const { synchronizeSequences, formatSequenceSyncReportTerminal } = await import('./mesh/index.js');
+      const report = await synchronizeSequences({ blueUrl, greenUrl, padding, dryRun, format });
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSequenceSyncReportTerminal(report));
+      }
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge mesh sync-sequences error: ${err.message}`);
+      return 1;
+    }
+  }
+
+  // --- establish-rollback subcommand ---
+  if (sub === 'establish-rollback') {
+    const subArgs = argv.slice(1);
+    let blueUrl = '';
+    let greenUrl = '';
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge mesh establish-rollback --blue <url> --green <url> [options]
+
+Establish bi-directional reverse replication from Green back to Blue.
+Uses PostgreSQL 16+ origin=none to prevent infinite replication loops.
+
+FLAGS:
+  --blue <url>        Blue (original source) PostgreSQL connection URL (required)
+  --green <url>       Green (promoted target) PostgreSQL connection URL (required)
+  --dry-run           Preview SQL without executing
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--blue') { i++; if (i < subArgs.length) blueUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--blue=')) { blueUrl = arg.slice('--blue='.length); i++; continue; }
+      if (arg === '--green') { i++; if (i < subArgs.length) greenUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--green=')) { greenUrl = arg.slice('--green='.length); i++; continue; }
+      if (arg === '--dry-run') { dryRun = true; i++; continue; }
+      if (arg === '--format') { i++; if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any; i++; continue; }
+      if (arg.startsWith('--format=')) { const f = arg.slice('--format='.length); if (f === 'json' || f === 'terminal') format = f as any; i++; continue; }
+      i++;
+    }
+
+    if (!blueUrl) { console.error('ddlforge mesh establish-rollback: --blue <url> is required.'); return 1; }
+    if (!greenUrl) { console.error('ddlforge mesh establish-rollback: --green <url> is required.'); return 1; }
+
+    try {
+      const { establishRollback, formatEstablishReportTerminal } = await import('./mesh/index.js');
+      const report = await establishRollback({ blueUrl, greenUrl, dryRun });
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatEstablishReportTerminal(report));
+      }
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge mesh establish-rollback error: ${err.message}`);
+      return 1;
+    }
+  }
+
+  // --- rollback subcommand ---
+  if (sub === 'rollback') {
+    const subArgs = argv.slice(1);
+    let blueUrl = '';
+    let greenUrl = '';
+    let databaseName = '';
+    let roleName = '';
+    let slotName = 'ddlforge_rollback_slot';
+    let padding = 1000;
+    let timeoutMs = 120000;
+    let dryRun = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge mesh rollback --blue <url> --green <url> --db <name> [options]
+
+Execute emergency zero-data-loss rollback from Green back to Blue.
+
+FLAGS:
+  --blue <url>        Blue (original source) PostgreSQL connection URL (required)
+  --green <url>       Green (current active) PostgreSQL connection URL (required)
+  --db <name>         Database name to fence (required)
+  --role <name>       Role name to fence (optional)
+  --slot <name>       Reverse replication slot name (default: ddlforge_rollback_slot)
+  --padding <n>       Sequence padding watermark (default: 1000)
+  --timeout-ms <n>    Maximum rollback timeout in ms (default: 120000)
+  --dry-run           Simulate rollback without making changes
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--blue') { i++; if (i < subArgs.length) blueUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--blue=')) { blueUrl = arg.slice('--blue='.length); i++; continue; }
+      if (arg === '--green') { i++; if (i < subArgs.length) greenUrl = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--green=')) { greenUrl = arg.slice('--green='.length); i++; continue; }
+      if (arg === '--db') { i++; if (i < subArgs.length) databaseName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--db=')) { databaseName = arg.slice('--db='.length); i++; continue; }
+      if (arg === '--role') { i++; if (i < subArgs.length) roleName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--role=')) { roleName = arg.slice('--role='.length); i++; continue; }
+      if (arg === '--slot') { i++; if (i < subArgs.length) slotName = subArgs[i]; i++; continue; }
+      if (arg.startsWith('--slot=')) { slotName = arg.slice('--slot='.length); i++; continue; }
+      if (arg === '--padding') { i++; if (i < subArgs.length) padding = parseInt(subArgs[i], 10) || 1000; i++; continue; }
+      if (arg.startsWith('--padding=')) { padding = parseInt(arg.slice('--padding='.length), 10) || 1000; i++; continue; }
+      if (arg === '--timeout-ms') { i++; if (i < subArgs.length) timeoutMs = parseInt(subArgs[i], 10) || 120000; i++; continue; }
+      if (arg.startsWith('--timeout-ms=')) { timeoutMs = parseInt(arg.slice('--timeout-ms='.length), 10) || 120000; i++; continue; }
+      if (arg === '--dry-run') { dryRun = true; i++; continue; }
+      if (arg === '--format') { i++; if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any; i++; continue; }
+      if (arg.startsWith('--format=')) { const f = arg.slice('--format='.length); if (f === 'json' || f === 'terminal') format = f as any; i++; continue; }
+      i++;
+    }
+
+    if (!blueUrl) { console.error('ddlforge mesh rollback: --blue <url> is required.'); return 1; }
+    if (!greenUrl) { console.error('ddlforge mesh rollback: --green <url> is required.'); return 1; }
+    if (!databaseName) { console.error('ddlforge mesh rollback: --db <name> is required.'); return 1; }
+
+    try {
+      const { executeRollback, formatRollbackReportTerminal } = await import('./mesh/index.js');
+      const report = await executeRollback({ blueUrl, greenUrl, databaseName, roleName: roleName || undefined, slotName, padding, timeoutMs, dryRun, format });
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatRollbackReportTerminal(report));
+      }
+      return report.finalPhase === 'COMPLETE' ? 0 : 1;
+    } catch (err: any) {
+      console.error(`ddlforge mesh rollback error: ${err.message}`);
+      return 1;
+    }
+  }
+
+  console.error(`ddlforge mesh: Unknown subcommand "${sub}". Supported: init, cutover, sync-sequences, establish-rollback, rollback.`);
+  return 1;
+}
