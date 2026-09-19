@@ -39,7 +39,7 @@ export interface ApplyOptions {
   help: boolean;
 }
 
-export const VERSION = '1.8.0';
+export const VERSION = '1.9.0';
 
 export function parseArgs(args: string[]): CliOptions {
   const options: CliOptions = {
@@ -173,9 +173,41 @@ USAGE:
   ddlforge contract --table <table> ...    # generate GitLab 3-release teardown script
   ddlforge test [options]                  # run migrations against ephemeral PostgreSQL container
   ddlforge doctor [options]                # continuous WAL archival health & disaster recovery readiness
-  ddlforge verify-backup [options]         # verify restored instance health, recovery state & amcheck
   ddlforge compact <estimate|table|index>  # zero-downtime table compaction & bloat estimator
   ddlforge tenant <migrate|audit|sweep>    # multi-tenant distribution & drift auditing
+  ddlforge advisor <analyze|simulate|prune> # autonomous telemetry, hypopg simulation & index pruner
+
+── ADVISOR (query telemetry, hypopg simulation & index pruner) ─
+  ddlforge advisor analyze [options]
+  ddlforge advisor simulate --query <sql> --index <sql> [options]
+  ddlforge advisor prune [options]
+
+SUBCOMMANDS:
+  analyze             Mine table Read/Write ratios, HOT update efficiencies, and slow queries
+  simulate            Simulate hypothetical index in-memory with hypopg to calculate cost reduction
+  prune               Discover unused, prefix-subsumed redundant, and invalid indexes
+
+ANALYZE FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --limit <n>         Max slow queries to display from pg_stat_statements (default: 10)
+  --format <type>     Output format: terminal | json (default: terminal)
+
+SIMULATE FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --query <sql>       SQL query to benchmark with EXPLAIN (FORMAT JSON)
+  --index <sql>       CREATE INDEX statement to simulate in-memory
+  --format <type>     Output format: terminal | json (default: terminal)
+
+PRUNE FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --min-size-mb <n>   Minimum index size in MB to consider for pruning (default: 0)
+  --max-scans <n>     Maximum index scans to qualify as unused (default: 0)
+  --drop              Execute DROP INDEX CONCURRENTLY on safe prunable candidates
+  --format <type>     Output format: terminal | json (default: terminal)
 
 ── TENANT (multi-tenant distribution & drift auditing) ─────────
   ddlforge tenant migrate [options]
@@ -814,6 +846,11 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   // Detect tenant subcommand (multi-tenant distribution, state machine & drift auditing)
   if (argv[0] === 'tenant') {
     return runTenant(argv.slice(1));
+  }
+
+  // Detect advisor subcommand (autonomous telemetry, hypopg simulation & index pruner)
+  if (argv[0] === 'advisor') {
+    return runAdvisor(argv.slice(1));
   }
 
   // Explicit check subcommand (e.g. ddlforge check ...)
@@ -4758,6 +4795,418 @@ FLAGS:
   }
 
   console.error(`ddlforge tenant: Unknown subcommand "${sub}". Supported subcommands: migrate, audit, sweep.`);
+  return 1;
+}
+
+/**
+ * Executes the `ddlforge advisor` subcommand.
+ */
+export async function runAdvisor(argv: string[]): Promise<number> {
+  const sub = argv[0];
+
+  if (!sub || sub === '--help' || sub === '-h') {
+    console.log(`
+ddlforge advisor <subcommand> [options]
+
+Autonomous query telemetry, hypothetical index simulation (hypopg), and index lifecycle advisor.
+
+SUBCOMMANDS:
+  analyze             Mine table Read/Write ratios, HOT update efficiencies, and slow queries
+  simulate            Simulate hypothetical index in-memory with hypopg to calculate cost reduction
+  prune               Discover unused, prefix-subsumed redundant, and invalid indexes
+
+EXAMPLES:
+  $ ddlforge advisor analyze --db postgres://localhost/mydb
+  $ ddlforge advisor simulate --query "SELECT * FROM users WHERE email = 'test'" --index "CREATE INDEX idx ON users(email)" --db postgres://localhost/mydb
+  $ ddlforge advisor prune --db postgres://localhost/mydb --min-size-mb 10
+`);
+    return 0;
+  }
+
+  // Subcommand 1: ddlforge advisor analyze
+  if (sub === 'analyze') {
+    const subArgs = argv.slice(1);
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let table = '';
+    let schema = 'public';
+    let limit = 10;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge advisor analyze [options]
+
+Mine table Read/Write ratios, HOT update efficiencies, and pg_stat_statements telemetry.
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --limit <n>         Max slow queries to display from pg_stat_statements (default: 10)
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < subArgs.length) table = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < subArgs.length) schema = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--limit') {
+        i++;
+        if (i < subArgs.length) limit = parseInt(subArgs[i], 10) || 10;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--limit=')) {
+        limit = parseInt(arg.slice('--limit='.length), 10) || 10;
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl) {
+      console.error('ddlforge advisor analyze: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { harvestFullWorkloadReport, formatWorkloadReportTerminal } = await import('./advisor/index.js');
+      const report = await harvestFullWorkloadReport(pool, {
+        schema,
+        table: table || undefined,
+        limit,
+      });
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatWorkloadReportTerminal(report));
+      }
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge advisor analyze error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  // Subcommand 2: ddlforge advisor simulate
+  if (sub === 'simulate') {
+    const subArgs = argv.slice(1);
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let query = '';
+    let indexSql = '';
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge advisor simulate --query <sql> --index <create-index-sql> [options]
+
+Simulate hypothetical index in-memory with hypopg to calculate cost reduction.
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --query <sql>       SQL query to benchmark with EXPLAIN (FORMAT JSON)
+  --index <sql>       CREATE INDEX statement to simulate in-memory
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--query') {
+        i++;
+        if (i < subArgs.length) query = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--query=')) {
+        query = arg.slice('--query='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--index') {
+        i++;
+        if (i < subArgs.length) indexSql = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--index=')) {
+        indexSql = arg.slice('--index='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl) {
+      console.error('ddlforge advisor simulate: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    if (!query || !indexSql) {
+      console.error('ddlforge advisor simulate: Both --query <sql> and --index <sql> flags are required.');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { simulateHypotheticalIndex, formatSimulationReportTerminal } = await import('./advisor/index.js');
+      const report = await simulateHypotheticalIndex(pool, {
+        query,
+        createIndexSql: indexSql,
+      });
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatSimulationReportTerminal(report));
+      }
+
+      return report.recommendation === 'REJECTED_BY_PLANNER' ? 1 : 0;
+    } catch (err: any) {
+      console.error(`ddlforge advisor simulate error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  // Subcommand 3: ddlforge advisor prune
+  if (sub === 'prune') {
+    const subArgs = argv.slice(1);
+    let dbUrl = process.env['DATABASE_URL'] ?? '';
+    let table = '';
+    let schema = 'public';
+    let minSizeMb = 0;
+    let maxScans = 0;
+    let executeDrop = false;
+    let format: 'terminal' | 'json' = 'terminal';
+
+    let i = 0;
+    while (i < subArgs.length) {
+      const arg = subArgs[i];
+      if (arg === '--help' || arg === '-h') {
+        console.log(`
+ddlforge advisor prune [options]
+
+Discover unused, prefix-subsumed redundant, and invalid indexes.
+
+FLAGS:
+  --db <url>          PostgreSQL connection URL (or DATABASE_URL)
+  --table <table>     Filter by specific table name (optional)
+  --schema <name>     Target PostgreSQL schema (default: public)
+  --min-size-mb <n>   Minimum index size in MB to consider for pruning (default: 0)
+  --max-scans <n>     Maximum index scans to qualify as unused (default: 0)
+  --drop              Execute DROP INDEX CONCURRENTLY on safe prunable candidates
+  --format <type>     Output format: terminal | json (default: terminal)
+  --help, -h          Print this help message and exit
+`);
+        return 0;
+      }
+      if (arg === '--db') {
+        i++;
+        if (i < subArgs.length) dbUrl = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--db=')) {
+        dbUrl = arg.slice('--db='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--table') {
+        i++;
+        if (i < subArgs.length) table = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--table=')) {
+        table = arg.slice('--table='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--schema') {
+        i++;
+        if (i < subArgs.length) schema = subArgs[i];
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--schema=')) {
+        schema = arg.slice('--schema='.length);
+        i++;
+        continue;
+      }
+      if (arg === '--min-size-mb') {
+        i++;
+        if (i < subArgs.length) minSizeMb = parseFloat(subArgs[i]) || 0;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--min-size-mb=')) {
+        minSizeMb = parseFloat(arg.slice('--min-size-mb='.length)) || 0;
+        i++;
+        continue;
+      }
+      if (arg === '--max-scans') {
+        i++;
+        if (i < subArgs.length) maxScans = parseInt(subArgs[i], 10) || 0;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--max-scans=')) {
+        maxScans = parseInt(arg.slice('--max-scans='.length), 10) || 0;
+        i++;
+        continue;
+      }
+      if (arg === '--drop') {
+        executeDrop = true;
+        i++;
+        continue;
+      }
+      if (arg === '--format') {
+        i++;
+        if (i < subArgs.length && (subArgs[i] === 'json' || subArgs[i] === 'terminal')) format = subArgs[i] as any;
+        i++;
+        continue;
+      }
+      if (arg.startsWith('--format=')) {
+        const f = arg.slice('--format='.length);
+        if (f === 'json' || f === 'terminal') format = f as any;
+        i++;
+        continue;
+      }
+      i++;
+    }
+
+    if (!dbUrl) {
+      console.error('ddlforge advisor prune: Missing required database connection URL (--db or DATABASE_URL).');
+      return 1;
+    }
+
+    const { Pool } = await import('pg');
+    const pool = new Pool({ connectionString: dbUrl });
+
+    try {
+      const { queryPrunableIndexes, formatPruneReportTerminal } = await import('./advisor/index.js');
+      const report = await queryPrunableIndexes(pool, {
+        schema,
+        table: table || undefined,
+        minSizeMb,
+        maxScans,
+      });
+
+      if (executeDrop && report.candidates.length > 0) {
+        console.log(`[ddlforge advisor prune] Executing concurrent drops for ${report.candidates.length} candidate(s)...`);
+        for (const c of report.candidates) {
+          if (!c.isSafeToDrop) {
+            console.log(`  ⚠ Skipping "${c.indexName}": flagged with caution (${c.safetyWarnings.join('; ')})`);
+            continue;
+          }
+          console.log(`  Executing: ${c.dropSql}`);
+          try {
+            await pool.query(`SET lock_timeout = '2s';`);
+            await pool.query(c.dropSql);
+            console.log(`  ✔ Successfully dropped "${c.indexName}".`);
+          } catch (dropErr: any) {
+            console.error(`  ✖ Failed to drop "${c.indexName}": ${dropErr.message}`);
+          }
+        }
+      }
+
+      if (format === 'json') {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatPruneReportTerminal(report));
+      }
+
+      return 0;
+    } catch (err: any) {
+      console.error(`ddlforge advisor prune error: ${err.message}`);
+      return 1;
+    } finally {
+      await pool.end().catch(() => {});
+    }
+  }
+
+  console.error(`ddlforge advisor: Unknown subcommand "${sub}". Supported subcommands: analyze, simulate, prune.`);
   return 1;
 }
 

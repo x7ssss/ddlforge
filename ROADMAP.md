@@ -314,4 +314,55 @@
 - `test/distributed/twoPhaseCoordinator.test.ts`: Unit tests for DDL normalization, SHA-256 checksumming, state ledger transitions, consensus-based orphan healing, and sweep reporting.
 - `test/distributed/driftAuditor.test.ts`: Unit tests for canonical schema fingerprint hashing, golden schema determination, diff calculation, and zero-downtime reconciliation SQL generation.
 - `test/distributed/cli.test.ts`: Unit tests for `ddlforge tenant` CLI routing, `migrate`, `audit`, `sweep` subcommands, help screens, error handling, and JSON formatting.
+
+---
+
+## ✅ v1.9.0: Autonomous Query Telemetry, Hypothetical Index Simulation (hypopg), and Index Lifecycle Advisor (COMPLETED)
+
+### 1. Autonomous Query Telemetry & Workload Analyzer (`src/advisor/telemetryHarvester.ts`)
+- **Write Amplification vs Read Latency**: Eliminates third-party APM dependency by directly mining internal PostgreSQL catalog views:
+  - `pg_stat_user_tables`: `seq_scan`, `seq_tup_read`, `idx_scan`, `idx_tup_fetch`, `n_tup_ins`, `n_tup_upd`, `n_tup_del`, `n_tup_hot_upd`.
+  - `pg_stat_statements`: `queryid`, `calls`, `total_exec_time`, `mean_exec_time`, `rows`, `shared_blks_read`, `shared_blks_hit`, `temp_blks_written`.
+- **Mathematical Ratios & Heuristic Engine**:
+  - **Read/Write Ratio**: `(idx_tup_fetch + seq_tup_read) / (n_tup_ins + n_tup_upd + n_tup_del)`
+  - **HOT Update Efficiency**: `(n_tup_hot_upd / n_tup_upd) * 100`
+  - **Workload Classification**: `READ_HEAVY` (>= 10.0), `BALANCED` (3.0 - 10.0), `WRITE_LEANING` (1.0 - 3.0), `WRITE_HEAVY` (< 1.0).
+  - **HOT Update Preservation Guard**: Flags tables with R/W < 1.0 (`HIGH` risk) or HOT > 80% (`MEDIUM` risk) to prevent index proliferation that causes `HEAP_UPDATE_ALL_INDEXES` cascades and write bloat.
+  - **Candidate Detection**: Flags tables with >= 100 sequential scans and R/W >= 2.0 as index candidates.
+- **CLI Subcommand**: `ddlforge advisor analyze [--db <url>] [--schema <name>] [--table <table>] [--limit <n>] [--format terminal|json]`.
+
+### 2. Hypothetical Index Simulator (`src/advisor/hypoSimulator.ts`)
+- **Zero-Overhead Memory Simulation via `hypopg`**:
+  - Injects hypothetical indexes in session-local memory via `hypopg_create_index(indexSql)`.
+  - Bypasses physical disk allocation, lock contention, and WAL generation.
+  - Queries virtual index footprint via `hypopg_relation_size()`.
+- **Planner Adoption & Cost Differential Analysis**:
+  - Benchmarks baseline query plan via `EXPLAIN (FORMAT JSON)`.
+  - Traverses hypothetical plan tree recursively (`isIndexUsedInPlan`) to verify if the PostgreSQL planner chose the virtual index.
+  - Calculates cost improvement percentage: `((baselineCost - hypoCost) / baselineCost) * 100`.
+  - Classifies outcome: `STRONG_RECOMMENDATION` (cost reduction >= 30%), `MARGINAL_IMPROVEMENT` (reduction > 0%), or `REJECTED_BY_PLANNER` (planner prefers seq scan or existing index).
+- **Leak-Proof Session Reset**: Guarantees invocation of `SELECT hypopg_reset();` inside `finally` blocks, preventing memory leakage or subsequent plan pollution.
+- **CLI Subcommand**: `ddlforge advisor simulate --query <sql> --index <create-index-sql> [--db <url>] [--format terminal|json]`.
+
+### 3. Unused & Redundant Index Pruner (`src/advisor/pruner.ts`)
+- **Prefix Subsumption Engine (`isPrefixSubsumed`)**:
+  - Evaluates multi-column B-Tree index key sequences (e.g. `(a)` subsumed by `(a, b)`).
+  - Matches partial index predicate expressions (`indpred`) to prevent incorrect pruning of filtered indexes.
+- **Strict Safety Guards**:
+  - Never prunes Primary Keys (`contype = 'p'`) or Unique constraints (`contype = 'u'`).
+  - Identifies Foreign Key backing indexes (`contype = 'f'`) and flags caution (`isSafeToDrop: false`) to prevent table-level lock escalation during parent record mutations.
+  - Retrieves `stats_reset` timestamp from `pg_stat_database` to guard against premature pruning on freshly reset telemetry.
+- **Invalid Index Self-Healing**:
+  - Queries `pg_index.indisvalid = false` to identify broken index artifacts left behind by interrupted or failed `CREATE INDEX CONCURRENTLY` runs.
+- **Autocommit Safe Removal**:
+  - Generates zero-downtime `DROP INDEX CONCURRENTLY IF EXISTS "<schema>"."<name>";` statements.
+  - CLI `--drop` flag runs drops sequentially with `lock_timeout = '2s'` on verified safe candidates.
+- **CLI Subcommand**: `ddlforge advisor prune [--db <url>] [--schema <name>] [--table <table>] [--min-size-mb <n>] [--max-scans <n>] [--drop] [--format terminal|json]`.
+
+### 4. Test Suite
+- `test/advisor/telemetryHarvester.test.ts`: Unit tests for Read/Write ratio math, HOT efficiency calculations, workload classification boundaries, indexing risk evaluation, table/query catalog telemetry parsing, and terminal formatting.
+- `test/advisor/hypoSimulator.test.ts`: Unit tests for EXPLAIN JSON plan parsing, recursive plan tree search, cost delta calculation, hypopg simulation with strong recommendation / marginal / rejected planner outcomes, and guaranteed `hypopg_reset()` session cleanup in `finally` blocks.
+- `test/advisor/pruner.test.ts`: Unit tests for prefix containment logic, redundant index identification, primary key / unique constraint exclusion, foreign key safety warnings, invalid index detection, live catalog query mocking, and terminal output formatting.
+- `test/advisor/cli.test.ts`: Unit tests for `ddlforge advisor` routing, `analyze`, `simulate`, and `prune` subcommands, help screens, and parameter validations.
+
 

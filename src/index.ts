@@ -52,3 +52,6 @@ export * from './compaction/index.js';
 
 // Distributed (Multi-Tenant Distribution, Distributed DDL State Machine & Drift Auditing)
 export * from './distributed/index.js';
+
+// Advisor (Autonomous Query Telemetry, HypoPG Simulation & Index Lifecycle Advisor)
+export * from './advisor/index.js';
