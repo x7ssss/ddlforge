@@ -13,7 +13,7 @@
 
 ---
 
-## ⚡ 60-Second Interactive Demo
+## ⚡ Interactive Demo
 
 Experience ddlforge's lock pre-emption circuit breaker, statistical bloat estimator, and Blue/Green CDC cutover in your terminal without configuring a database:
 
