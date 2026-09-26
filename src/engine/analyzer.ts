@@ -53,6 +53,10 @@ export function applyRuleConfig(
     'add-column-not-null-without-default': ['add-column-not-null'],
     'check-constraint-not-valid': ['check-constraint-missing-not-valid'],
     'check-constraint-missing-not-valid': ['check-constraint-not-valid'],
+    'concurrent-in-transaction': ['concurrent-index-in-transaction'],
+    'concurrent-index-in-transaction': ['concurrent-in-transaction'],
+    'partition-scan-lock': ['attach-partition-missing-check'],
+    'attach-partition-missing-check': ['partition-scan-lock'],
   };
 
   function findConfigValue(finding: Finding): string | boolean | undefined {

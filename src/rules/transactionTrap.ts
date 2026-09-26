@@ -8,7 +8,7 @@
 import { Rule, RuleContext, Finding } from './types.js';
 import { PostgresLockLevel } from '../engine/locks.js';
 
-function isConcurrentIndexStatement(tokens: Array<{ value: string }>): boolean {
+function isConcurrentOperationStatement(tokens: Array<{ value: string }>): boolean {
   if (tokens.length < 3) return false;
 
   // CREATE [UNIQUE] INDEX CONCURRENTLY
@@ -30,13 +30,22 @@ function isConcurrentIndexStatement(tokens: Array<{ value: string }>): boolean {
     }
   }
 
+  // DETACH PARTITION CONCURRENTLY
+  for (let i = 0; i < tokens.length - 2; i++) {
+    if (tokens[i].value === 'DETACH' && tokens[i + 1]?.value === 'PARTITION') {
+      for (let j = i + 2; j < tokens.length; j++) {
+        if (tokens[j].value === 'CONCURRENTLY') return true;
+      }
+    }
+  }
+
   return false;
 }
 
 export const transactionTrapRule: Rule = {
   id: 'concurrent-index-in-transaction',
   name: 'CONCURRENTLY inside Transaction Trap',
-  description: 'PostgreSQL aborts transactions containing concurrent index builds or drops.',
+  description: 'PostgreSQL aborts transactions containing concurrent index builds, drops, or partition detach operations.',
   defaultSeverity: 'BLOCKER',
   lockLevel: PostgresLockLevel.NONE,
 
@@ -64,11 +73,11 @@ export const transactionTrapRule: Rule = {
         continue;
       }
 
-      // Check if this statement is CREATE INDEX CONCURRENTLY or DROP INDEX CONCURRENTLY
-      const isConcurrentIndexOp = isConcurrentIndexStatement(tokens);
+      // Check if this statement is a concurrent operation (CREATE/DROP INDEX CONCURRENTLY or DETACH PARTITION CONCURRENTLY)
+      const isConcurrentOp = isConcurrentOperationStatement(tokens);
 
-      if (isConcurrentIndexOp) {
-        if (stmt.hasIgnore(this.id)) continue;
+      if (isConcurrentOp) {
+        if (stmt.hasIgnore(this.id) || stmt.hasIgnore('concurrent-index-in-transaction') || stmt.hasIgnore('concurrent-in-transaction')) continue;
 
         // Scenario 1: Inside an explicit transaction block
         if (inExplicitTransaction) {
@@ -77,10 +86,10 @@ export const transactionTrapRule: Rule = {
             ruleName: this.name,
             severity: this.defaultSeverity,
             lockLevel: this.lockLevel,
-            message: 'CONCURRENTLY index operation cannot run inside an explicit transaction block.',
+            message: 'Concurrent statement (CONCURRENTLY) cannot run inside an explicit transaction block.',
             detail:
               `Statement at line ${stmt.startLine} is inside a transaction block started at line ${transactionStartLine}. ` +
-              'PostgreSQL rejects concurrent index operations with "ERROR: CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block".',
+              'PostgreSQL rejects concurrent operations with "ERROR: ... cannot run inside a transaction block" (SQLSTATE 25001).',
             suggestion: 'Remove the enclosing BEGIN ... COMMIT block and execute the CONCURRENTLY statement standalone.',
             file: context.filePath,
             line: stmt.startLine,

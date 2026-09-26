@@ -392,6 +392,46 @@ export function generateRemediation(
     }
   }
 
+  // 8. Volatile default
+  if (ruleId === 'volatile-default') {
+    return generateAddColumnNotNullRemediation(rawSql);
+  }
+
+  // 9. Non-concurrent drop index
+  if (ruleId === 'non-concurrent-drop-index') {
+    const raw = rawSql.trim().replace(/;+$/, '');
+    const m = /^DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?([^\s;]+)/i.exec(raw);
+    const idxName = m ? m[1] : 'index_name';
+    return [
+      '-- Phase 1: Drop index concurrently (run outside transaction blocks)',
+      `DROP INDEX CONCURRENTLY ${idxName};`,
+    ].join('\n');
+  }
+
+  // 10. Partition attach scan lock
+  if (ruleId === 'partition-scan-lock' || ruleId === 'attach-partition-missing-check') {
+    const raw = rawSql.trim().replace(/;+$/, '');
+    const m = /ALTER\s+TABLE\s+(?:ONLY\s+|IF\s+EXISTS\s+)*([^\s;]+)\s+ATTACH\s+PARTITION\s+([^\s;]+)(.*)/i.exec(raw);
+    if (m) {
+      const parent = cleanIdentifier(m[1]);
+      const part = cleanIdentifier(m[2]);
+      const rest = m[3] ? m[3].trim() : '';
+      return [
+        `-- Phase 1: Add NOT VALID check constraint matching partition bounds on "${part}"`,
+        `ALTER TABLE ${part} ADD CONSTRAINT chk_${part}_bounds CHECK (<bounds_condition>) NOT VALID;`,
+        '',
+        `-- Phase 2: Validate constraint asynchronously without blocking writes`,
+        `ALTER TABLE ${part} VALIDATE CONSTRAINT chk_${part}_bounds;`,
+        '',
+        `-- Phase 3: Attach partition (full table scan skipped because constraint is validated)`,
+        `ALTER TABLE ${parent} ATTACH PARTITION ${part} ${rest};`,
+        '',
+        `-- Phase 4: Drop redundant check constraint`,
+        `ALTER TABLE ${part} DROP CONSTRAINT chk_${part}_bounds;`,
+      ].join('\n');
+    }
+  }
+
   return undefined;
 }
 

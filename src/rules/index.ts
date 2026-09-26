@@ -32,6 +32,12 @@ export { enumRecreateTableRewriteRule } from './enumRecreateTableRewrite.js';
 export { nonTransactionalInTransactionRule } from './nonTransactionalInTransaction.js';
 export { lockAccumulationMixedDdlDmlRule } from './lockAccumulationMixedDdlDml.js';
 
+// Production Postmortem Adversarial Rules (PG 13-17)
+export { volatileDefaultRule } from './volatileDefault.js';
+export { nonConcurrentDropIndexRule } from './nonConcurrentDropIndex.js';
+export { partitionScanLockRule } from './partitionScanLock.js';
+export { primaryKeyUsingIndexNullableRule } from './primaryKeyUsingIndexNullable.js';
+
 import { Rule } from './types.js';
 import { indexConcurrentlyRule } from './indexConcurrently.js';
 import { transactionTrapRule } from './transactionTrap.js';
@@ -59,6 +65,11 @@ import { attachPartitionMissingCheckRule } from './attachPartitionMissingCheck.j
 import { enumRecreateTableRewriteRule } from './enumRecreateTableRewrite.js';
 import { nonTransactionalInTransactionRule } from './nonTransactionalInTransaction.js';
 import { lockAccumulationMixedDdlDmlRule } from './lockAccumulationMixedDdlDml.js';
+
+import { volatileDefaultRule } from './volatileDefault.js';
+import { nonConcurrentDropIndexRule } from './nonConcurrentDropIndex.js';
+import { partitionScanLockRule } from './partitionScanLock.js';
+import { primaryKeyUsingIndexNullableRule } from './primaryKeyUsingIndexNullable.js';
 
 export const ALL_RULES: Rule[] = [
   indexConcurrentlyRule,
@@ -89,5 +100,11 @@ export const ALL_RULES: Rule[] = [
   enumRecreateTableRewriteRule,
   nonTransactionalInTransactionRule,
   lockAccumulationMixedDdlDmlRule,
+
+  // Production Postmortem Adversarial Rules (PG 13-17)
+  volatileDefaultRule,
+  nonConcurrentDropIndexRule,
+  partitionScanLockRule,
+  primaryKeyUsingIndexNullableRule,
 ];
 

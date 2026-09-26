@@ -96,7 +96,7 @@ export const foreignKeyNotValidRule: Rule = {
     const findings: Finding[] = [];
 
     for (const stmt of context.statements) {
-      if (stmt.hasIgnore(this.id)) continue;
+      if (stmt.hasIgnore(this.id) || stmt.hasIgnore('foreign-key-missing-not-valid') || stmt.hasIgnore('unvalidated-foreign-key')) continue;
 
       const tokens = stmt.tokens;
       if (tokens.length < 6) continue;
