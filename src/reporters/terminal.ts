@@ -8,6 +8,7 @@ import { AnalysisResult } from '../engine/analyzer.js';
 export interface TerminalReporterOptions {
   quiet?: boolean;
   color?: boolean;
+  suggestFix?: boolean;
 }
 
 const supportsColor = (override?: boolean): boolean => {
@@ -20,6 +21,7 @@ const supportsColor = (override?: boolean): boolean => {
 export function formatTerminal(results: AnalysisResult[], options: TerminalReporterOptions = {}): string {
   const useColor = supportsColor(options.color);
   const quiet = options.quiet ?? false;
+  const suggestFix = options.suggestFix ?? false;
 
   const c = {
     reset: useColor ? '\x1b[0m' : '',
@@ -93,6 +95,9 @@ export function formatTerminal(results: AnalysisResult[], options: TerminalRepor
       }
 
       if (finding.remediation) {
+        if (suggestFix) {
+          lines.push(`   ${c.cyan}${c.bold}💡 Recommended Safe Fix:${c.reset}`);
+        }
         lines.push(`   ${c.cyan}${c.bold}Zero-Downtime Remediation Recipe:${c.reset}`);
         const remLines = finding.remediation.split('\n');
         for (const rLine of remLines) {

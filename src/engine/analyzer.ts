@@ -8,6 +8,7 @@ import { Finding, Rule, RuleContext } from '../rules/types.js';
 import { ALL_RULES } from '../rules/index.js';
 import { PostgresLockLevel } from './locks.js';
 import { processWaivers, WaiverOptions } from './waivers.js';
+import { attachRemediations } from './remediation.js';
 
 export interface AnalyzerOptions extends WaiverOptions {
   filePath?: string;
@@ -153,6 +154,9 @@ export class MigrationAnalyzer {
       const ruleFindings = rule.check(context);
       rawFindings.push(...ruleFindings);
     }
+
+    // Attach zero-downtime remediations for any finding missing one
+    attachRemediations(rawFindings, statements);
 
     // Apply declarative config rule overrides (.ddlforgerc.json)
     if (options.ruleConfig) {

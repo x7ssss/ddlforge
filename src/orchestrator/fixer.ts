@@ -20,14 +20,9 @@ export interface FixResult {
  * Computes a safe replacement for a finding if a known remediation recipe exists.
  */
 export function getSafeReplacement(finding: Finding, stmt: Statement): string | null {
-  // 1. If finding already provides an explicit multi-phase remediation recipe
-  if (finding.remediation && finding.remediation.trim().length > 0) {
-    return finding.remediation;
-  }
-
   const raw = stmt.raw;
 
-  // 2. require-concurrent-index: add CONCURRENTLY modifier
+  // 1. require-concurrent-index: add CONCURRENTLY modifier directly in-place
   if (finding.ruleId === 'require-concurrent-index') {
     if (/^CREATE\s+UNIQUE\s+INDEX\b/i.test(raw)) {
       return raw.replace(/^CREATE\s+UNIQUE\s+INDEX\b/i, 'CREATE UNIQUE INDEX CONCURRENTLY') + ';';
@@ -37,18 +32,23 @@ export function getSafeReplacement(finding: Finding, stmt: Statement): string | 
     }
   }
 
-  // 3. reindex-missing-concurrently: add CONCURRENTLY
+  // 2. reindex-missing-concurrently: add CONCURRENTLY
   if (finding.ruleId === 'reindex-missing-concurrently') {
     if (/^REINDEX\s+(TABLE|INDEX|SCHEMA)\b/i.test(raw)) {
       return raw.replace(/^REINDEX\s+(TABLE|INDEX|SCHEMA)\b/i, 'REINDEX $1 CONCURRENTLY') + ';';
     }
   }
 
-  // 4. detach-partition-non-concurrent: add CONCURRENTLY
+  // 3. detach-partition-non-concurrent: add CONCURRENTLY
   if (finding.ruleId === 'detach-partition-non-concurrent') {
     if (/DETACH\s+PARTITION\s+([a-zA-Z0-9_."]+)/i.test(raw)) {
       return raw.replace(/DETACH\s+PARTITION\s+([a-zA-Z0-9_."]+)/i, 'DETACH PARTITION $1 CONCURRENTLY') + ';';
     }
+  }
+
+  // 4. If finding already provides an explicit multi-phase remediation recipe
+  if (finding.remediation && finding.remediation.trim().length > 0) {
+    return finding.remediation;
   }
 
   // 5. check-constraint-missing-not-valid: add NOT VALID + VALIDATE CONSTRAINT

@@ -11,6 +11,7 @@ export * from './lexer/sqlTokenizer.js';
 export * from './engine/locks.js';
 export * from './engine/analyzer.js';
 export * from './engine/waivers.js';
+export * from './engine/remediation.js';
 export * from './config.js';
 
 // Rules

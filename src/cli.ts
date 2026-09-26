@@ -23,6 +23,7 @@ export interface CliOptions {
   quiet: boolean;
   changedOnly: boolean;
   fix: boolean;
+  suggestFix: boolean;
   help: boolean;
   version: boolean;
   githubActions: boolean;
@@ -56,6 +57,7 @@ export function parseArgs(args: string[]): CliOptions {
     quiet: false,
     changedOnly: false,
     fix: false,
+    suggestFix: false,
     help: false,
     version: false,
     githubActions: isGithubActions,
@@ -82,6 +84,12 @@ export function parseArgs(args: string[]): CliOptions {
 
     if (arg === '--fix') {
       options.fix = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--suggest-fix') {
+      options.suggestFix = true;
       i++;
       continue;
     }
@@ -499,6 +507,7 @@ FLAGS:
   --quiet, -q         Suppress advisories/warnings and emit blockers only
   --changed-only      Use git diff to lint only staged or branch-modified migration files
   --fix               Automatically apply safe remediation recipes in-place for detected blockers
+  --suggest-fix       Generate and display deterministic multi-phase zero-downtime remediation templates
   --version, -v       Print ddlforge version and exit
   --help, -h          Print this help message and exit
 
@@ -1048,15 +1057,21 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
   } else if (options.format === 'github' || options.githubActions) {
     formattedOutput = formatGithub(results, {
       dangerousLockTitle: options.githubActions || options.format === 'github',
+      suggestFix: options.suggestFix || options.githubActions,
     });
   } else {
-    formattedOutput = formatTerminal(results, { quiet: options.quiet });
+    formattedOutput = formatTerminal(results, {
+      quiet: options.quiet,
+      suggestFix: options.suggestFix,
+    });
   }
 
   // Write summary table to GITHUB_STEP_SUMMARY if present
   if (process.env.GITHUB_STEP_SUMMARY) {
     try {
-      writeStepSummary(process.env.GITHUB_STEP_SUMMARY, results);
+      writeStepSummary(process.env.GITHUB_STEP_SUMMARY, results, {
+        suggestFix: options.suggestFix || options.githubActions,
+      });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`Warning: Could not write GITHUB_STEP_SUMMARY: ${msg}`);

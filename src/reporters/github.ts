@@ -21,6 +21,13 @@ export interface GithubReporterOptions {
   emitAdvisories?: boolean;
   /** If true, uses standard title "Dangerous Lock ({ruleId})" without col property */
   dangerousLockTitle?: boolean;
+  /** If true, includes recommended safe fix remediation snippet */
+  suggestFix?: boolean;
+}
+
+export interface StepSummaryOptions {
+  /** If true, includes recommended safe fix codeblock in summary */
+  suggestFix?: boolean;
 }
 
 /**
@@ -61,6 +68,8 @@ export function formatGithub(
   options: GithubReporterOptions = {}
 ): string {
   const { emitAdvisories = false, dangerousLockTitle = false } = options;
+  const isGithubActions = dangerousLockTitle || process.env.GITHUB_ACTIONS === 'true';
+  const shouldSuggestFix = options.suggestFix ?? isGithubActions;
   const lines: string[] = [];
 
   for (const res of results) {
@@ -71,7 +80,12 @@ export function formatGithub(
       const fileProp = escapePropertyValue(rawFile);
       const lineProp = String(finding.line ?? 1);
       const colProp  = String(finding.column ?? 1);
-      const msg      = escapeData(finding.message);
+
+      let messageText = finding.message;
+      if (shouldSuggestFix && finding.remediation && finding.remediation.trim().length > 0) {
+        messageText += `\n\n💡 Recommended Safe Fix:\n\`\`\`sql\n${finding.remediation.trim()}\n\`\`\``;
+      }
+      const msg      = escapeData(messageText);
 
       let props: string;
       if (dangerousLockTitle) {
@@ -123,14 +137,19 @@ function getDowntimeRisk(finding: Finding): string {
 /**
  * Generates a clean Markdown summary table showing:
  *   File, Line, Statement, Lock Type, Downtime Risk, and Recommended Fix.
+ * Appends a 💡 Recommended Safe Fix codeblock section when fixes are available.
  */
-export function generateStepSummary(results: AnalysisResult[]): string {
+export function generateStepSummary(
+  results: AnalysisResult[],
+  options: StepSummaryOptions = {}
+): string {
   const rows: string[] = [];
   rows.push('### ddlforge Migration Safety Summary\n');
   rows.push('| File | Line | Statement | Lock Type | Downtime Risk | Recommended Fix |');
   rows.push('| --- | --- | --- | --- | --- | --- |');
 
   let totalFindings = 0;
+  const findingsWithFix: Array<{ file: string; line: string; ruleId: string; remediation: string }> = [];
 
   for (const res of results) {
     for (const finding of res.findings) {
@@ -152,6 +171,15 @@ export function generateStepSummary(results: AnalysisResult[]): string {
         .trim();
 
       rows.push(`| ${file} | ${line} | ${statement} | ${lockType} | ${downtimeRisk} | ${recFix} |`);
+
+      if (finding.remediation && finding.remediation.trim().length > 0) {
+        findingsWithFix.push({
+          file,
+          line,
+          ruleId: finding.ruleId,
+          remediation: finding.remediation.trim(),
+        });
+      }
     }
   }
 
@@ -159,13 +187,36 @@ export function generateStepSummary(results: AnalysisResult[]): string {
     return '### ddlforge Migration Safety Summary\n\n✅ All migration statements passed safety checks. Zero dangerous locks detected.\n';
   }
 
-  return rows.join('\n') + '\n';
+  let summaryMarkdown = rows.join('\n') + '\n';
+
+  const isGithubActions = process.env.GITHUB_ACTIONS === 'true';
+  const shouldSuggestFix = options.suggestFix !== false && (
+    options.suggestFix === true ||
+    isGithubActions ||
+    findingsWithFix.length > 0
+  );
+
+  if (shouldSuggestFix && findingsWithFix.length > 0) {
+    summaryMarkdown += '\n### 💡 Recommended Safe Fix\n\n';
+    for (const item of findingsWithFix) {
+      summaryMarkdown += `#### \`${item.file}:${item.line}\` (${item.ruleId})\n\n`;
+      summaryMarkdown += '```sql\n';
+      summaryMarkdown += item.remediation + '\n';
+      summaryMarkdown += '```\n\n';
+    }
+  }
+
+  return summaryMarkdown;
 }
 
 /**
  * Appends the clean summary table to GITHUB_STEP_SUMMARY if the environment variable is present.
  */
-export function writeStepSummary(summaryPath: string, results: AnalysisResult[]): void {
-  const markdown = generateStepSummary(results);
+export function writeStepSummary(
+  summaryPath: string,
+  results: AnalysisResult[],
+  options?: StepSummaryOptions
+): void {
+  const markdown = generateStepSummary(results, options);
   fs.appendFileSync(summaryPath, markdown, 'utf-8');
 }
