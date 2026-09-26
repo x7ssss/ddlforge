@@ -937,8 +937,8 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return runDemo(argv.slice(1));
   }
 
-  // Explicit check subcommand (e.g. ddlforge check ...)
-  if (argv[0] === 'check') {
+  // Explicit check/lint subcommand (e.g. ddlforge check ... or ddlforge lint ...)
+  if (argv[0] === 'check' || argv[0] === 'lint') {
     argv = argv.slice(1);
   }
 

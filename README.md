@@ -202,7 +202,7 @@ In `package.json`:
 
 ### 3. CI/CD Pipeline Gate (GitHub Actions)
 
-Add this workflow to `.github/workflows/ddlforge-gate.yml` to automatically analyze pull requests, annotate SQL diffs, and benchmark lock hold times:
+`ddlforge` natively integrates into GitHub Actions pull request workflows. Pass `--github-actions` (or let it auto-detect `process.env.GITHUB_ACTIONS === 'true'`) to format failing violations as standard workflow annotation commands and publish a structured summary table to `$GITHUB_STEP_SUMMARY`:
 
 ```yaml
 name: ddlforge Migration Reliability Gate
@@ -229,16 +229,93 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # 1. Zero-dependency static linting with GitHub inline annotations
-      - name: Lint Migration SQL
-        run: npx ddlforge check ./prisma/migrations --format github
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 1. Zero-dependency static linting with native PR annotations and step summary
+      - name: Lint Postgres Migrations
+        run: npx ddlforge lint ./migrations --github-actions
 
       # 2. Ephemeral container validation (samples lock hold times every 50ms)
       - name: Ephemeral Container Lock Benchmark
         run: npx ddlforge test --max-lock-ms 250
 ```
+
+When active, `ddlforge`:
+- Emits native workflow commands directly to stdout, creating inline PR annotations on the exact failing lines:
+  ```
+  ::error file=migrations/20260927_init.sql,line=12,title=Dangerous Lock (require-concurrent-index)::CREATE INDEX missing CONCURRENTLY keyword. [LOCK: SHARE]
+  ```
+- Automatically appends a structured Markdown table to `$GITHUB_STEP_SUMMARY` showing:
+  - **File**: Path to migration file
+  - **Line**: 1-based source coordinate
+  - **Statement**: SQL statement snippet
+  - **Lock Type**: Acquired PostgreSQL lock level (`ACCESS EXCLUSIVE`, `SHARE`, etc.)
+  - **Downtime Risk**: Impact assessment (e.g. `Critical / High (Full Table Lock - Blocks Reads & Writes)`)
+  - **Recommended Fix**: Zero-downtime remediation instructions
+
+---
+
+## 📝 Statement-Level Inline Waivers
+
+When a dangerous operation cannot be avoided (e.g., initial table provisioning or scheduled maintenance windows), suppress the specific rule directly above the target DDL statement using an inline waiver comment:
+
+```sql
+-- ddlforge-disable-next-line lock-access-exclusive reason="INC-4029: Sunday off-peak maintenance window" expires="2026-12-31"
+ALTER TABLE orders ADD COLUMN legacy_status VARCHAR(32) NOT NULL DEFAULT 'pending';
+```
+
+### Waiver Syntax & Options
+
+```sql
+-- ddlforge-disable-next-line <rule-id> reason="<mandatory-reason>" [expires="YYYY-MM-DD"]
+```
+
+| Parameter | Type | Required | Description |
+| :--- | :--- | :---: | :--- |
+| `<rule-id>` | string | **Yes** | Specific rule ID (e.g. `drop-column-lock`, `require-concurrent-index`), lock group (`lock-access-exclusive`), rule alias (`non-concurrent-index`, `unvalidated-foreign-key`), or wildcard (`*`). |
+| `reason="..."` | string | **Yes** | Mandatory operational rationale. Must be **at least 8 characters** long; shorter or missing reasons reject the waiver with `INVALID_WAIVER`. |
+| `expires="..."`| string | Optional | Expiration date in `YYYY-MM-DD` ISO format. If the current date is past this date, suppression is ignored, an `EXPIRED_WAIVER` blocker is emitted, and the lint check fails. |
+
+### Validation & Operational Rules
+
+1. **Strict Single-Statement Scope (No Bleed):** The waiver binds strictly to the immediate next SQL statement. Comments and suppressions never bleed to subsequent statements in multi-statement migration files.
+2. **Mandatory Reason Enforcement:** Waivers missing `reason=` or specifying a reason shorter than 8 characters are rejected immediately with an `INVALID_WAIVER` blocker.
+3. **Automated Expiration Check:** Expired waivers trigger an `EXPIRED_WAIVER` blocker finding and fail the CI check (exit code `1`), preventing abandoned or forgotten waivers in long-lived migration repositories.
+4. **Full SARIF 2.1.0 Compatibility:** Suppressed findings are preserved in SARIF reports (`--format sarif`) marked with:
+   ```json
+   "suppressions": [{ "kind": "inSource" }]
+   ```
+
+---
+
+## ⚙️ Declarative Configuration (`.ddlforgerc.json`)
+
+`ddlforge` automatically discovers `.ddlforgerc.json` (or `.ddlforge.json`) in the project root with zero external runtime dependencies.
+
+### Config Schema
+
+```json
+{
+  "targetVersion": "16",
+  "rules": {
+    "lock-access-exclusive": "error",
+    "non-concurrent-index": "error",
+    "unvalidated-foreign-key": "error"
+  },
+  "ignore": ["db/migrate/legacy/**"]
+}
+```
+
+| Property | Type | Description |
+| :--- | :--- | :--- |
+| `targetVersion` | `string` \| `number` | Target PostgreSQL major version (e.g. `"16"`, `15`). Sets default for version-dependent rule semantics (e.g., `SET NOT NULL` in PG11 vs PG12+). |
+| `rules` | `object` | Severity overrides (`"error"`, `"warn"`, `"off"`). Supports exact rule IDs, lock-level meta-rules (`"lock-access-exclusive"`), and rule aliases (`"non-concurrent-index"`, `"unvalidated-foreign-key"`). |
+| `ignore` | `string[]` | Glob patterns of migration files or directories to exclude from scanning (e.g. legacy migrations, archive folders). |
+
+### Precedence & Overrides
+
+Explicit CLI flags cleanly override `.ddlforgerc.json` configuration values:
+- `--pg <v>` overrides `targetVersion`.
+- `--config <path>` specifies a custom configuration file path.
+- Positional target paths restrict analysis to specific files or directories.
 
 ---
 
@@ -403,6 +480,7 @@ Usage: ddlforge <COMMAND> [OPTIONS]
 | Command / Flag | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `check <dir>` | command | - | Statically inspects migration SQL files for zero-downtime rule violations |
+| `lint <dir>` | command | - | Alias for `check`: lints migration SQL files for dangerous locks and traps |
 | `run <file>` | command | - | Executes migration with bounded lock acquisition and autonomous circuit breaking |
 | `wrap -- <cmd>` | command | - | Supervises external migration CLI (Prisma, Drizzle, Flyway) with pre-flight checks |
 | `preflight <file>` | command | - | Simulates write blast radius, forecasts WAL surge volume, and verifies disk headroom |
@@ -418,9 +496,11 @@ Usage: ddlforge <COMMAND> [OPTIONS]
 | `mesh init` | command | - | Initializes zero-data-loss CDC logical replication mesh for major version upgrades |
 | `mesh cutover` | command | - | Performs atomic fence LSN validation, sequence padding, and traffic cutover |
 | `top` | command | - | Real-time terminal monitor displaying PostgreSQL lock contention trees |
+| `--github-actions` | flag | `false` | Emits PR workflow annotations and publishes `$GITHUB_STEP_SUMMARY` table |
+| `--config <path>` | string | auto | Explicit path to `.ddlforgerc.json` or `.ddlforge.json` configuration file |
 | `--max-lock-ms <ms>` | number | `250` | Maximum lock acquisition wait timeout before circuit breaker aborts |
 | `--retry-limit <n>` | number | `5` | Maximum jittered retry attempts after lock acquisition pre-emption |
-| `--pg-version <ver>` | number | `16` | Target PostgreSQL major version for syntax and lock taxonomy evaluation |
+| `--pg <ver>` | number | `16` | Target PostgreSQL major version for syntax and lock taxonomy evaluation |
 | `--format <fmt>` | enum | `terminal` | Output format: `terminal`, `json`, `github`, `sarif` |
 | `--dry-run` | flag | `false` | Simulates execution without making live database modifications |
 | `-h, --help` | flag | - | Prints help interface |
