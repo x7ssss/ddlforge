@@ -541,7 +541,8 @@ export function splitStatements(sql: string): Statement[] {
           currentTokens,
           [...statementComments, ...pendingComments],
           start + bomOffset,
-          end + bomOffset
+          end + bomOffset,
+          [...statementCommentTokens, ...pendingCommentTokens]
         ));
         currentTokens = [];
         statementComments = [];
@@ -589,7 +590,8 @@ export function splitStatements(sql: string): Statement[] {
       currentTokens,
       [...statementComments, ...pendingComments],
       start + bomOffset,
-      end + bomOffset
+      end + bomOffset,
+      [...statementCommentTokens, ...pendingCommentTokens]
     ));
   }
 
@@ -600,7 +602,8 @@ function createStatement(
   tokens: Token[],
   comments: string[],
   startOffset: number = 0,
-  endOffset: number = 0
+  endOffset: number = 0,
+  commentTokens: Token[] = []
 ): Statement {
   const startLine = tokens[0]?.line ?? 1;
   const startColumn = tokens[0]?.column ?? 1;
@@ -614,6 +617,7 @@ function createStatement(
     raw,
     tokens,
     comments,
+    commentTokens,
     startLine,
     startColumn,
     endLine,
@@ -625,9 +629,9 @@ function createStatement(
         const lower = comment.toLowerCase();
         // Check standard ignore patterns:
         // -- ddlforge-ignore
-        // -- ddlforge-disable
+        // -- ddlforge-disable (excluding ddlforge-disable-next-line which is statement waiver)
         // -- ddlforge-ignore <ruleId>
-        if (lower.includes('ddlforge-ignore') || lower.includes('ddlforge-disable')) {
+        if (lower.includes('ddlforge-ignore') || (lower.includes('ddlforge-disable') && !lower.includes('ddlforge-disable-next-line'))) {
           if (!ruleId) return true;
           if (lower.includes(ruleId.toLowerCase())) return true;
           // Bare ignore comment applies to all rules for that statement

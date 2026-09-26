@@ -28,6 +28,7 @@ export interface Statement {
   raw: string;
   tokens: Token[];
   comments: string[];
+  commentTokens?: Token[];
   startLine: number;
   startColumn: number;
   endLine: number;

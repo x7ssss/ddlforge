@@ -20,6 +20,9 @@ export interface Finding {
   column: number;
   codeSnippet: string;
   remediation?: string;
+  suppressed?: boolean;
+  waiverReason?: string;
+  suppressions?: Array<{ kind: 'inSource' | string; justification?: string }>;
 }
 
 export interface RuleContext {

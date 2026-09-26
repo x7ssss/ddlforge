@@ -10,6 +10,8 @@ export * from './lexer/sqlTokenizer.js';
 // Engine & Locks
 export * from './engine/locks.js';
 export * from './engine/analyzer.js';
+export * from './engine/waivers.js';
+export * from './config.js';
 
 // Rules
 export * from './rules/index.js';

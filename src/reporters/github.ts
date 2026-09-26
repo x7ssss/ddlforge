@@ -2,17 +2,25 @@
  * ddlforge - GitHub Actions Workflow Commands reporter
  *
  * Formats diagnostics as GitHub Actions annotation commands:
- *   ::error file={f},line={l},col={c},title=ddlforge::{message}
- *   ::warning file={f},line={l},col={c},title=ddlforge::{message}
+ *   ::error file={f},line={l},title=Dangerous Lock ({ruleId})::{message}
+ *   ::warning file={f},line={l},title=Dangerous Lock ({ruleId})::{message}
+ *
+ * Also provides GITHUB_STEP_SUMMARY table generation with:
+ *   File, Line, Statement, Lock Type, Downtime Risk, Recommended Fix
  *
  * Reference: https://docs.github.com/en/actions/writing-workflows/choosing-what-your-workflow-does/workflow-commands-for-github-actions
  */
 
+import * as fs from 'node:fs';
 import { AnalysisResult } from '../engine/analyzer.js';
+import { Finding } from '../rules/types.js';
+import { PostgresLockLevel } from '../engine/locks.js';
 
 export interface GithubReporterOptions {
   /** If true, also emit a ::notice for advisory findings (default: false) */
   emitAdvisories?: boolean;
+  /** If true, uses standard title "Dangerous Lock ({ruleId})" without col property */
+  dangerousLockTitle?: boolean;
 }
 
 /**
@@ -42,29 +50,37 @@ function escapeData(value: string): string {
 /**
  * Formats analysis results as GitHub Actions workflow commands.
  *
- * Each BLOCKER finding produces an `::error ...` annotation.
- * Each WARNING finding produces a `::warning ...` annotation.
- * ADVISORY findings produce `::notice ...` annotations only when
- * `options.emitAdvisories` is true.
+ * When dangerousLockTitle is true (e.g. via --github-actions):
+ *   ::error file={filePath},line={line},title=Dangerous Lock ({ruleId})::{message}
  *
- * Returns a newline-joined string ready for direct `process.stdout.write`.
+ * When dangerousLockTitle is false (legacy default):
+ *   ::error file={filePath},line={line},col={column},title=ddlforge::{message}
  */
 export function formatGithub(
   results: AnalysisResult[],
   options: GithubReporterOptions = {}
 ): string {
-  const { emitAdvisories = false } = options;
+  const { emitAdvisories = false, dangerousLockTitle = false } = options;
   const lines: string[] = [];
 
   for (const res of results) {
     for (const finding of res.findings) {
-      const fileProp = escapePropertyValue(finding.file ?? res.file);
+      if (finding.suppressed) continue;
+
+      const rawFile = finding.file ?? res.file;
+      const fileProp = escapePropertyValue(rawFile);
       const lineProp = String(finding.line ?? 1);
       const colProp  = String(finding.column ?? 1);
-      const title    = 'ddlforge';
       const msg      = escapeData(finding.message);
 
-      const props = `file=${fileProp},line=${lineProp},col=${colProp},title=${title}`;
+      let props: string;
+      if (dangerousLockTitle) {
+        const titleProp = escapePropertyValue(`Dangerous Lock (${finding.ruleId})`);
+        props = `file=${fileProp},line=${lineProp},title=${titleProp}`;
+      } else {
+        const titleProp = 'ddlforge';
+        props = `file=${fileProp},line=${lineProp},col=${colProp},title=${titleProp}`;
+      }
 
       if (finding.severity === 'BLOCKER') {
         lines.push(`::error ${props}::${msg}`);
@@ -77,4 +93,79 @@ export function formatGithub(
   }
 
   return lines.join('\n');
+}
+
+/**
+ * Derives a human-readable downtime risk description from lock level and severity.
+ */
+function getDowntimeRisk(finding: Finding): string {
+  if (finding.lockLevel === PostgresLockLevel.ACCESS_EXCLUSIVE) {
+    return 'Critical / High (Full Table Lock - Blocks Reads & Writes)';
+  }
+  if (finding.lockLevel === PostgresLockLevel.EXCLUSIVE) {
+    return 'High (Blocks Reads & Writes)';
+  }
+  if (finding.lockLevel === PostgresLockLevel.SHARE || finding.lockLevel === PostgresLockLevel.SHARE_ROW_EXCLUSIVE) {
+    return 'High (Blocks Concurrent Writes)';
+  }
+  if (finding.lockLevel === PostgresLockLevel.SHARE_UPDATE_EXCLUSIVE) {
+    return 'Low (Concurrent Safe)';
+  }
+  if (finding.severity === 'BLOCKER') {
+    return 'High (Migration Blocker)';
+  }
+  if (finding.severity === 'WARNING') {
+    return 'Medium';
+  }
+  return 'Low';
+}
+
+/**
+ * Generates a clean Markdown summary table showing:
+ *   File, Line, Statement, Lock Type, Downtime Risk, and Recommended Fix.
+ */
+export function generateStepSummary(results: AnalysisResult[]): string {
+  const rows: string[] = [];
+  rows.push('### ddlforge Migration Safety Summary\n');
+  rows.push('| File | Line | Statement | Lock Type | Downtime Risk | Recommended Fix |');
+  rows.push('| --- | --- | --- | --- | --- | --- |');
+
+  let totalFindings = 0;
+
+  for (const res of results) {
+    for (const finding of res.findings) {
+      if (finding.suppressed) continue;
+      totalFindings++;
+
+      const file = (finding.file ?? res.file).replace(/\\/g, '/');
+      const line = String(finding.line ?? 1);
+      const rawStmt = (finding.codeSnippet || finding.message)
+        .replace(/\r?\n/g, ' ')
+        .replace(/\|/g, '\\|')
+        .trim();
+      const statement = `\`${rawStmt.length > 60 ? rawStmt.slice(0, 57) + '...' : rawStmt}\``;
+      const lockType = finding.lockLevel ?? 'NONE';
+      const downtimeRisk = getDowntimeRisk(finding);
+      const recFix = (finding.suggestion || finding.detail || 'None')
+        .replace(/\r?\n/g, ' ')
+        .replace(/\|/g, '\\|')
+        .trim();
+
+      rows.push(`| ${file} | ${line} | ${statement} | ${lockType} | ${downtimeRisk} | ${recFix} |`);
+    }
+  }
+
+  if (totalFindings === 0) {
+    return '### ddlforge Migration Safety Summary\n\n✅ All migration statements passed safety checks. Zero dangerous locks detected.\n';
+  }
+
+  return rows.join('\n') + '\n';
+}
+
+/**
+ * Appends the clean summary table to GITHUB_STEP_SUMMARY if the environment variable is present.
+ */
+export function writeStepSummary(summaryPath: string, results: AnalysisResult[]): void {
+  const markdown = generateStepSummary(results);
+  fs.appendFileSync(summaryPath, markdown, 'utf-8');
 }

@@ -49,11 +49,17 @@ export interface SarifReportingDescriptor {
   helpUri: string;
 }
 
+export interface SarifSuppression {
+  kind: 'inSource' | 'external' | string;
+  justification?: string;
+}
+
 export interface SarifResult {
   ruleId: string;
   level: 'error' | 'warning' | 'note';
   message: SarifMessage;
   locations: SarifLocation[];
+  suppressions?: SarifSuppression[];
 }
 
 export interface SarifMessage {
@@ -123,19 +129,39 @@ export function formatSarif(results: AnalysisResult[], rules: Rule[] = ALL_RULES
     helpUri: `${TOOL_INFO_URI}#${rule.id}`,
   }));
 
-  // Collect all findings across all results
+  // Collect all findings (both active and suppressed) across all results
   const sarifResults: SarifResult[] = [];
   const uniqueFiles = new Set<string>();
+  const ruleIdSet = new Set(sarifRules.map((r) => r.id));
 
   for (const analysisResult of results) {
-    for (const finding of analysisResult.findings) {
+    const allFindings = [
+      ...analysisResult.findings,
+      ...(analysisResult.suppressedFindings ?? []),
+    ];
+
+    for (const finding of allFindings) {
       uniqueFiles.add(finding.file);
+
+      // Dynamically add descriptors for synthetic rules (e.g. INVALID_WAIVER, EXPIRED_WAIVER)
+      if (!ruleIdSet.has(finding.ruleId)) {
+        ruleIdSet.add(finding.ruleId);
+        sarifRules.push({
+          id: finding.ruleId,
+          shortDescription: { text: finding.ruleName || finding.ruleId },
+          fullDescription: { text: finding.detail || finding.message || finding.ruleId },
+          defaultConfiguration: {
+            level: severityToLevel(finding.severity),
+          },
+          helpUri: `${TOOL_INFO_URI}#${finding.ruleId}`,
+        });
+      }
 
       const messageParts: string[] = [finding.message];
       if (finding.detail) messageParts.push(finding.detail);
       if (finding.suggestion) messageParts.push(`Fix: ${finding.suggestion}`);
 
-      sarifResults.push({
+      const sarifItem: SarifResult = {
         ruleId: finding.ruleId,
         level: severityToLevel(finding.severity),
         message: { text: messageParts.join('. ') },
@@ -153,7 +179,13 @@ export function formatSarif(results: AnalysisResult[], rules: Rule[] = ALL_RULES
             },
           },
         ],
-      });
+      };
+
+      if (finding.suppressed || (finding.suppressions && finding.suppressions.length > 0)) {
+        sarifItem.suppressions = [{ kind: 'inSource' }];
+      }
+
+      sarifResults.push(sarifItem);
     }
   }
 

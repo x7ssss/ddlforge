@@ -10,7 +10,8 @@ import { formatTerminal } from './reporters/terminal.js';
 import { formatJson } from './reporters/json.js';
 import { formatMarkdown } from './reporters/markdown.js';
 import { formatSarif } from './reporters/sarif.js';
-import { formatGithub } from './reporters/github.js';
+import { formatGithub, writeStepSummary } from './reporters/github.js';
+import { loadConfig, filterIgnoredFiles, matchesIgnorePattern, DdlforgeConfig } from './config.js';
 // executor is imported dynamically inside runApply() to preserve
 // zero-dependency invariant for static linting (ddlforge check).
 
@@ -24,6 +25,8 @@ export interface CliOptions {
   fix: boolean;
   help: boolean;
   version: boolean;
+  githubActions: boolean;
+  config?: string;
 }
 
 /** Options parsed from `ddlforge apply <file> --db <url> [flags]` */
@@ -44,17 +47,22 @@ export const VERSION = '2.0.0';
 export { runDemo } from './demo.js';
 
 export function parseArgs(args: string[]): CliOptions {
+  const isGithubActions = process.env.GITHUB_ACTIONS === 'true';
   const options: CliOptions = {
     targets: [],
     pgVersion: 16,
-    format: 'terminal',
+    format: isGithubActions ? 'github' : 'terminal',
     output: undefined,
     quiet: false,
     changedOnly: false,
     fix: false,
     help: false,
     version: false,
+    githubActions: isGithubActions,
+    config: undefined,
   };
+
+  let formatExplicitlySet = false;
 
   let i = 0;
   while (i < args.length) {
@@ -86,6 +94,29 @@ export function parseArgs(args: string[]): CliOptions {
 
     if (arg === '--changed-only') {
       options.changedOnly = true;
+      i++;
+      continue;
+    }
+
+    if (arg === '--github-actions') {
+      options.githubActions = true;
+      if (!formatExplicitlySet) {
+        options.format = 'github';
+      }
+      i++;
+      continue;
+    }
+
+    if (arg === '--config') {
+      i++;
+      if (i < args.length) {
+        options.config = args[i];
+      }
+      i++;
+      continue;
+    }
+    if (arg.startsWith('--config=')) {
+      options.config = arg.slice('--config='.length);
       i++;
       continue;
     }
@@ -127,6 +158,7 @@ export function parseArgs(args: string[]): CliOptions {
         } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif' || fmt === 'github') {
           options.format = fmt;
         }
+        formatExplicitlySet = true;
       }
       i++;
       continue;
@@ -138,6 +170,7 @@ export function parseArgs(args: string[]): CliOptions {
       } else if (fmt === 'json' || fmt === 'markdown' || fmt === 'terminal' || fmt === 'sarif' || fmt === 'github') {
         options.format = fmt;
       }
+      formatExplicitlySet = true;
       i++;
       continue;
     }
@@ -681,12 +714,15 @@ export function parseApplyArgs(argv: string[]): ApplyOptions {
 }
 
 
-/**
- * Finds all .sql files from input paths, directories, or defaults.
- */
-export function discoverSqlFiles(targets: string[], changedOnly: boolean, cwd: string = process.cwd()): string[] {
+export function discoverSqlFiles(
+  targets: string[],
+  changedOnly: boolean,
+  cwd: string = process.cwd(),
+  ignore: string[] = []
+): string[] {
   if (changedOnly) {
-    return getChangedSqlFiles(cwd);
+    const changed = getChangedSqlFiles(cwd);
+    return filterIgnoredFiles(changed, ignore, cwd);
   }
 
   const filesToScan: string[] = [];
@@ -707,7 +743,7 @@ export function discoverSqlFiles(targets: string[], changedOnly: boolean, cwd: s
     }
   }
 
-  return filesToScan;
+  return filterIgnoredFiles(filesToScan, ignore, cwd);
 }
 
 function findDefaultMigrationTargets(cwd: string): string[] {
@@ -918,7 +954,22 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     return 0;
   }
 
-  const files = discoverSqlFiles(options.targets, options.changedOnly);
+  // Load declarative configuration (.ddlforgerc.json or .ddlforge.json)
+  const { config: fileConfig } = loadConfig(process.cwd(), options.config);
+
+  // Merge config: targetVersion (if not explicitly overridden by --pg flag in argv)
+  const hasPgArg = argv.some(a => a === '--pg' || a.startsWith('--pg='));
+  if (!hasPgArg && fileConfig?.targetVersion !== undefined) {
+    options.pgVersion = parseInt(String(fileConfig.targetVersion), 10) || options.pgVersion;
+  }
+
+  // Merge config: ignore patterns
+  const ignorePatterns = fileConfig?.ignore ?? [];
+
+  // Merge config: rule overrides
+  const ruleConfig = fileConfig?.rules ?? {};
+
+  const files = discoverSqlFiles(options.targets, options.changedOnly, process.cwd(), ignorePatterns);
 
   if (files.length === 0) {
     let emptyOutput = '';
@@ -928,16 +979,24 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       emptyOutput = formatMarkdown([]);
     } else if (options.format === 'sarif') {
       emptyOutput = formatSarif([]);
-    } else if (options.format === 'github') {
+    } else if (options.format === 'github' || options.githubActions) {
       emptyOutput = ''; // no annotations needed for empty set
     } else {
       emptyOutput = 'No migration .sql files found to analyze.';
+    }
+
+    if (process.env.GITHUB_STEP_SUMMARY) {
+      try {
+        writeStepSummary(process.env.GITHUB_STEP_SUMMARY, []);
+      } catch {}
     }
 
     if (options.output) {
       const outPath = path.isAbsolute(options.output) ? options.output : path.resolve(process.cwd(), options.output);
       fs.mkdirSync(path.dirname(outPath), { recursive: true });
       fs.writeFileSync(outPath, emptyOutput, 'utf-8');
+    } else if (options.format === 'github' || options.githubActions) {
+      // Nothing written to stdout for empty set
     } else {
       console.log(emptyOutput);
     }
@@ -953,6 +1012,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       let res = analyzer.analyze(content, {
         filePath: file,
         pgVersion: options.pgVersion,
+        ruleConfig,
       });
 
       if (options.fix && res.hasBlockers) {
@@ -966,6 +1026,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
           res = analyzer.analyze(content, {
             filePath: file,
             pgVersion: options.pgVersion,
+            ruleConfig,
           });
         }
       }
@@ -984,17 +1045,29 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
     formattedOutput = formatMarkdown(results);
   } else if (options.format === 'sarif') {
     formattedOutput = formatSarif(results);
-  } else if (options.format === 'github') {
-    formattedOutput = formatGithub(results);
+  } else if (options.format === 'github' || options.githubActions) {
+    formattedOutput = formatGithub(results, {
+      dangerousLockTitle: options.githubActions || options.format === 'github',
+    });
   } else {
     formattedOutput = formatTerminal(results, { quiet: options.quiet });
+  }
+
+  // Write summary table to GITHUB_STEP_SUMMARY if present
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try {
+      writeStepSummary(process.env.GITHUB_STEP_SUMMARY, results);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`Warning: Could not write GITHUB_STEP_SUMMARY: ${msg}`);
+    }
   }
 
   if (options.output) {
     const outPath = path.isAbsolute(options.output) ? options.output : path.resolve(process.cwd(), options.output);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, formattedOutput, 'utf-8');
-  } else if (options.format === 'github') {
+  } else if (options.format === 'github' || options.githubActions) {
     // Write workflow commands directly to stdout (bypasses console.log newline buffering)
     process.stdout.write(formattedOutput + (formattedOutput.length > 0 ? '\n' : ''));
   } else {
